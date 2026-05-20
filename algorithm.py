@@ -1,0 +1,456 @@
+"""Reactive obstacle-avoidance algorithm.
+
+Matches the project spec:
+
+    LOOP:
+      1. Read front, left, right distances.
+      2. If front distance < threshold:
+            stop, turn toward more open side
+      3. Else if left too close:
+            steer right slightly
+      4. Else if right too close:
+            steer left slightly
+      5. Else:
+            drive forward
+      6. Use encoder feedback to keep both wheels at similar speed.
+
+Three layers, separated by rate and concern:
+
+  - `step(reading, encoders, t)` (pure function)
+      Outer reactive decision @ loop_hz.  Returns commanded WheelSpeeds in m/s.
+      Wall-centering bias is folded in when both side rays return in-range
+      hits -- keeps the robot off corners that pure threshold logic blunders
+      into.  Trivial to unit-test.
+
+  - `ReactiveController`
+      Wraps `step` with stuck-detection / recovery state machine driven by
+      encoder feedback.  Without this, three-ray reactive nav wedges at
+      diagonal corners where all rays see past but the chassis doesn't fit.
+
+  - `WheelController`
+      Inner per-wheel PI loop, cmd_mps -> PWM duty.  Used by the hardware
+      adapter; the sim ignores it (commanded speed feeds the sim wheel
+      model directly).
+
+All three accept a single `Tunables` object -- nothing else here knows
+about magic numbers.
+
+CircuitPython-portable: no `typing`, no `@dataclass`, no f-strings.
+"""
+
+from interfaces import WheelSpeeds
+
+
+# -----------------------------------------------------------------------------
+# Optional flood-fill planner integration.  Imported lazily inside the
+# controller so that environments without `planner.py` (or hardware that
+# doesn't need it) still load `algorithm` cleanly.
+# -----------------------------------------------------------------------------
+
+
+# -----------------------------------------------------------------------------
+# Outer reactive loop (pure function)
+# -----------------------------------------------------------------------------
+
+def step(reading, encoders, t):
+    """Compute commanded wheel speeds for one control tick.
+
+    Args:
+        reading:  `Reading` -- front/left/right distances in meters.
+        encoders: (left_mps, right_mps) measured wheel speeds.  Unused at
+                  this layer (the inner controller closes that loop); kept
+                  in the signature for telemetry / future wall-following.
+        t:        `Tunables`.
+
+    Returns:
+        `WheelSpeeds` in m/s.
+    """
+    front = reading.front
+    left = reading.left
+    right = reading.right
+
+    # 1. Front blocked -> stop forward motion, pivot toward more open side.
+    if front < t.front_stop_m:
+        if left >= right:
+            return WheelSpeeds(-t.turn_speed_mps, +t.turn_speed_mps)
+        return WheelSpeeds(+t.turn_speed_mps, -t.turn_speed_mps)
+
+    # Risk-aware forward speed: cap so braking distance fits inside front
+    # clearance.  v_max = sqrt(2 * a_max * usable).
+    base = _safe_forward_speed(front, t)
+
+    # 2/3. Hard steer-away when a side gets too close.  Threshold logic
+    # from the spec; the wall-centering term below smooths the more
+    # common in-corridor case.
+    if left < t.side_min_m:
+        return WheelSpeeds(base, base * (1.0 - t.steer_gain))
+    if right < t.side_min_m:
+        return WheelSpeeds(base * (1.0 - t.steer_gain), base)
+
+    # 4. Both sides have headroom -> drive forward with a centering bias.
+    # When both sides return finite (< sensor_max_range), the robot is in
+    # something corridor-shaped -- bias toward the geometric center.
+    bias = _wall_center_bias(left, right, t)
+    if bias != 0.0:
+        # bias > 0 means "veer right"; bias < 0 means "veer left".
+        return WheelSpeeds(base * (1.0 + bias), base * (1.0 - bias))
+    return WheelSpeeds(base, base)
+
+
+def _safe_forward_speed(front_clearance, t):
+    """Cap commanded speed by available braking distance."""
+    import math
+    usable = front_clearance - t.front_stop_m
+    if usable <= 0.0:
+        return t.min_speed_mps
+    v_brake = math.sqrt(2.0 * t.max_decel_mps2 * usable)
+    v = v_brake
+    if v > t.max_speed_mps:
+        v = t.max_speed_mps
+    if v > t.cruise_speed_mps:
+        v = t.cruise_speed_mps
+    if v < t.min_speed_mps:
+        v = t.min_speed_mps
+    return v
+
+
+def _wall_center_bias(left, right, t):
+    """Steering bias in [-max_bias, +max_bias].  Positive = veer right.
+
+    Only fires when both side rays see something within sensor range -- if
+    one ray maxed out, the robot is at a corridor mouth or in an open area
+    and centering doesn't apply.
+    """
+    if t.wall_center_gain <= 0.0:
+        return 0.0
+    if left >= t.sensor_max_range_m or right >= t.sensor_max_range_m:
+        return 0.0
+    total = left + right
+    if total <= 1e-6:
+        return 0.0
+    # Closer to the left wall -> left < right -> err < 0 -> veer right (+).
+    err = (right - left) / total
+    bias = t.wall_center_gain * err
+    if bias > t.wall_center_max_bias:
+        bias = t.wall_center_max_bias
+    elif bias < -t.wall_center_max_bias:
+        bias = -t.wall_center_max_bias
+    return bias
+
+
+# -----------------------------------------------------------------------------
+# Inner loop: per-wheel speed -> PWM duty (encoder feedback)
+# -----------------------------------------------------------------------------
+
+class WheelController(object):
+    """PI controller on a single wheel.  cmd_mps in, PWM duty in [-1, 1].
+
+    Anti-windup via conditional integration; integrator reset on commanded
+    direction reversal.
+    """
+
+    __slots__ = ("kp", "ki", "_integral", "_last_cmd_sign", "duty_min", "duty_max")
+
+    def __init__(self, kp, ki, duty_min=-1.0, duty_max=1.0):
+        self.kp = kp
+        self.ki = ki
+        self._integral = 0.0
+        self._last_cmd_sign = 0
+        self.duty_min = duty_min
+        self.duty_max = duty_max
+
+    def update(self, cmd_mps, measured_mps, dt):
+        sign = 0 if cmd_mps == 0.0 else (1 if cmd_mps > 0.0 else -1)
+        if sign != self._last_cmd_sign:
+            self._integral = 0.0
+            self._last_cmd_sign = sign
+
+        err = cmd_mps - measured_mps
+        unclamped = self.kp * err + self.ki * self._integral
+        if unclamped > self.duty_max:
+            duty = self.duty_max
+        elif unclamped < self.duty_min:
+            duty = self.duty_min
+        else:
+            duty = unclamped
+            self._integral += err * dt
+        return duty
+
+
+# -----------------------------------------------------------------------------
+# Stateful controller: stuck detection + recovery
+# -----------------------------------------------------------------------------
+
+class ReactiveController(object):
+    """Wraps `step` with encoder-driven stuck recovery.
+
+    States:
+      REACT    -- normal reactive control.
+      REVERSE  -- briefly back up (open-loop, turn_speed_mps for reverse_time_s).
+      PIVOT    -- briefly pivot toward the more open side (pivot_time_s).
+
+    A "stuck" event is: commanded |speed| > stuck_speed_threshold_mps while
+    measured |speed| stays below the same threshold for stuck_time_s.  The
+    spec hints at this with "use encoder feedback"; this is the outer-loop
+    use of that signal.
+    """
+
+    _S_REACT = 0
+    _S_REVERSE = 1
+    _S_PIVOT = 2
+
+    STATE_NAMES = {0: "REACT", 1: "REVERSE", 2: "PIVOT"}
+
+    def __init__(self, tunables, planner=None, pose_provider=None):
+        """Args:
+            tunables:       `Tunables`.
+            planner:        Optional flood-fill planner (see `planner.py`).
+                            When provided, REACT runs as plan-then-execute
+                            (turn to the planner's cardinal, then drive
+                            forward).  When None, behaves exactly as the
+                            original reactive controller.
+            pose_provider:  Required when `planner` is set.  Callable
+                            returning the current world-frame pose
+                            (x, y, theta).  Sim wires it to SimWorld's
+                            ground truth; hardware wires it to an
+                            `EncoderOdometry` instance.
+        """
+        self.t = tunables
+        self.planner = planner
+        self.pose_provider = pose_provider
+        self._state = self._S_REACT
+        self._state_t = 0.0       # time spent in current state
+        self._stuck_t = 0.0       # accumulated stuck time in REACT
+        self._last_reading = None # cached on entry to recovery
+        self.recovery_count = 0
+        # Pivot hysteresis: when step() picks an in-place pivot direction,
+        # latch it for at least pivot_hysteresis_s.  Prevents chatter from
+        # near-equal L/R readings.  +1 = pivot CCW (left forward), -1 = CW.
+        self._pivot_dir = 0
+        self._pivot_t = 0.0       # time accumulated in current pivot direction
+        self._pivot_total_t = 0.0 # total continuous time pivoting in REACT
+        # Planner replan throttle and bookkeeping.
+        self._planner_t = 0.0
+        self._desired_heading = None
+
+    @property
+    def state(self):
+        return self._state
+
+    @property
+    def stuck_t(self):
+        return self._stuck_t
+
+    def step(self, reading, encoders, dt):
+        self._state_t += dt
+        T = self.t
+
+        if self._state == self._S_REACT:
+            if self.planner is not None:
+                cmd = self._planner_step(reading, dt)
+            else:
+                cmd = step(reading, encoders, T)
+                cmd = self._apply_pivot_hysteresis(cmd, reading, dt)
+
+            cmd_mag = abs(cmd.left) if abs(cmd.left) > abs(cmd.right) else abs(cmd.right)
+            meas_mag = abs(encoders[0]) if abs(encoders[0]) > abs(encoders[1]) else abs(encoders[1])
+            if cmd_mag > T.stuck_speed_threshold_mps and meas_mag < T.stuck_speed_threshold_mps:
+                self._stuck_t += dt
+                if self._stuck_t >= T.stuck_time_s:
+                    self._enter(self._S_REVERSE)
+                    self._last_reading = reading
+            else:
+                self._stuck_t = 0.0
+            # Pivot-stall escalation only applies when the reactive layer is
+            # doing the pivoting -- planner-driven turns are intentional and
+            # should not be treated as a stall.
+            if self.planner is None and self._pivot_total_t >= T.pivot_stall_s:
+                self._enter(self._S_REVERSE)
+                self._last_reading = reading
+                self._pivot_total_t = 0.0
+            return cmd
+
+        if self._state == self._S_REVERSE:
+            if self._state_t >= T.reverse_time_s:
+                self._enter(self._S_PIVOT)
+            else:
+                s = T.turn_speed_mps
+                return WheelSpeeds(-s, -s)
+
+        if self._state == self._S_PIVOT:
+            if self._state_t >= T.pivot_time_s:
+                self._enter(self._S_REACT)
+                self._stuck_t = 0.0
+                return step(reading, encoders, T)
+            r = self._last_reading or reading
+            s = T.turn_speed_mps
+            if r.left >= r.right:
+                return WheelSpeeds(-s, +s)
+            return WheelSpeeds(+s, -s)
+
+        return WheelSpeeds(0.0, 0.0)
+
+    def _enter(self, new_state):
+        self._state = new_state
+        self._state_t = 0.0
+        if new_state == self._S_REVERSE:
+            self.recovery_count += 1
+            # Clear pivot state when escaping to recovery.
+            self._pivot_dir = 0
+            self._pivot_t = 0.0
+            self._pivot_total_t = 0.0
+
+    def _apply_pivot_hysteresis(self, cmd, reading, dt):
+        """If step() picked an in-place pivot, latch the direction.
+
+        Without this, when |left - right| is small and noisy, step() flips
+        pivot direction every tick and the robot dithers in place.
+        """
+        T = self.t
+        is_pivot = (cmd.left * cmd.right < 0
+                    and abs(cmd.left) > T.min_speed_mps)
+        if not is_pivot:
+            self._pivot_dir = 0
+            self._pivot_t = 0.0
+            self._pivot_total_t = 0.0
+            return cmd
+
+        self._pivot_total_t += dt
+        if self._pivot_dir == 0:
+            # First tick of a new pivot -- adopt step's choice.
+            self._pivot_dir = +1 if cmd.right > cmd.left else -1
+            self._pivot_t = 0.0
+        else:
+            self._pivot_t += dt
+            if self._pivot_t >= T.pivot_hysteresis_s:
+                # Window expired -- allow step's fresh pick to take over.
+                fresh = +1 if cmd.right > cmd.left else -1
+                if fresh != self._pivot_dir:
+                    self._pivot_dir = fresh
+                    self._pivot_t = 0.0
+        s = T.turn_speed_mps
+        return WheelSpeeds(-self._pivot_dir * s, +self._pivot_dir * s)
+
+    # -- planner-driven REACT ------------------------------------------------
+
+    def _planner_step(self, reading, dt):
+        """Plan-then-execute step.
+
+        Each tick:
+          1. Pull pose from `pose_provider` and resolve current cell + heading.
+          2. If aligned with a cardinal, let the planner record walls from
+             the current ToF reading.
+          3. If at-or-past the cell centre along the current heading, ask
+             the planner for the next cardinal.  Before centre, commit to
+             the current heading -- turning mid-cell would leave the robot
+             off-axis in the perpendicular dimension and clip the next
+             cell's walls.
+          4. Issue motion -- in-place pivot when mis-aligned, else forward.
+
+        The reactive layer's stuck detection + REVERSE/PIVOT recovery still
+        wraps this (see `step()`), so a surprise wall mid-cell still gets
+        the safety bounce.
+        """
+        from planner import (theta_from_heading, heading_from_theta, wrap_pi)
+        T = self.t
+        x, y, theta = self.pose_provider()
+        cell = self.planner.pose_to_cell(x, y)
+        heading = heading_from_theta(theta)
+        cardinal_theta = theta_from_heading(heading)
+        align_err = abs(wrap_pi(cardinal_theta - theta))
+
+        s = self.planner.cell_size_m
+        c_idx, r_idx = cell
+        # Forward-in-cell projection (distance from cell rear edge along
+        # heading).  Used both for "are sides observable from here?" and
+        # "are we at-or-past cell centre for a turn decision?".
+        if heading == 0:      # N
+            forward_in_cell = y - r_idx * s
+        elif heading == 1:    # E
+            forward_in_cell = x - c_idx * s
+        elif heading == 2:    # S
+            forward_in_cell = (r_idx + 1) * s - y
+        else:                 # W
+            forward_in_cell = (c_idx + 1) * s - x
+        progress_past_centre = forward_in_cell - 0.5 * s
+
+        # Only update the map when reasonably well aligned with a cardinal.
+        if align_err < T.planner_observe_tol_rad:
+            observe_sides = forward_in_cell >= 0.5 * s
+            self.planner.observe((x, y, theta), cell, heading, reading,
+                                 observe_sides=observe_sides)
+
+        # Replan heartbeat (lazy replan inside the planner covers the rest).
+        self._planner_t += dt
+        if self._planner_t >= T.planner_replan_period_s:
+            self._planner_t = 0.0
+            if self.planner._dirty or self.planner._dist is None:
+                self.planner.replan()
+
+        # Pick a heading.  Decisions only happen at or past cell centre --
+        # before centre, commit to the current heading so we don't end up
+        # off-axis when the next cell's wall geometry takes over.
+        if progress_past_centre >= 0.0:
+            desired = self.planner.desired_heading(cell, heading)
+        else:
+            desired = heading
+        self._desired_heading = desired
+        target_theta = theta_from_heading(desired)
+        err = wrap_pi(target_theta - theta)
+
+        if abs(err) > T.planner_turn_threshold_rad:
+            # In-place pivot toward target heading.
+            s_turn = T.turn_speed_mps
+            if err > 0.0:
+                return WheelSpeeds(-s_turn, +s_turn)  # CCW
+            return WheelSpeeds(+s_turn, -s_turn)      # CW
+
+        # Aligned -- drive forward, risk-aware.  A small heading-error
+        # P-correction bleeds residual `err` off without flipping back to
+        # full pivot (err is bounded here by planner_turn_threshold_rad).
+        base = _safe_forward_speed(reading.front, T)
+        bias = T.steer_gain * err
+        max_bias = 0.5
+        if bias > max_bias:
+            bias = max_bias
+        elif bias < -max_bias:
+            bias = -max_bias
+        return WheelSpeeds(base * (1.0 - bias), base * (1.0 + bias))
+
+
+# -----------------------------------------------------------------------------
+# Top-level runner
+# -----------------------------------------------------------------------------
+
+def run(sensors, drive, clock, tunables, max_steps=None,
+        on_step=None, controller=None):
+    """Spin the control loop.
+
+    Args:
+        sensors:    `RangeSensors` impl.
+        drive:      `Drive` impl.
+        clock:      `Clock` impl.
+        tunables:   `Tunables`.
+        max_steps:  Stop after this many ticks (None = forever).
+        on_step:    Optional callback(step_idx, reading, encoders, cmd,
+                    controller) invoked each tick.
+        controller: Optional pre-built `ReactiveController`.  Default: a
+                    fresh one bound to `tunables`.
+    """
+    dt = 1.0 / tunables.loop_hz
+    if controller is None:
+        controller = ReactiveController(tunables)
+    i = 0
+    try:
+        while max_steps is None or i < max_steps:
+            reading = sensors.read()
+            encoders = drive.read_encoders()
+            cmd = controller.step(reading, encoders, dt)
+            drive.set_wheel_speeds(cmd)
+            if on_step is not None:
+                on_step(i, reading, encoders, cmd, controller)
+            clock.sleep(dt)
+            i += 1
+    finally:
+        drive.stop()
+    return i

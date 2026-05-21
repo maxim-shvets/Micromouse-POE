@@ -1,0 +1,16 @@
+{
+  "aggression_mode": "aggressive",
+  "cruise_speed_mps": 0.50,
+  "max_speed_mps": 0.80,
+  "turn_speed_mps": 0.25,
+  "front_stop_m": 0.06,
+  "side_min_m": 0.030,
+  "max_decel_mps2": 3.0,
+  "max_wheel_accel_mps2": 10.0,
+  "wall_center_gain": 0.3,
+  "planner_turn_cost": 0.5,
+  "planner_reverse_cost": 3.0,
+  "planner_unknown_cost": 0.3,
+  "loop_hz": 100.0,
+  "sim_max_substep_s": 0.002
+}

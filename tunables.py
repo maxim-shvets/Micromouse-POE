@@ -96,8 +96,33 @@ _DEFAULTS = {
     # cell sides, so we skip the observation rather than poison the map.
     "planner_observe_tol_rad":    0.15,
 
+    # --- Risk-weighted planner cost factors ------------------------------
+    # Each cell-to-cell step has cost 1.0 + (these).  Tuning these is the
+    # core lever of "aggression": cautious mode raises planner_turn_cost
+    # so the planner prefers fewer-turn paths even when longer; aggressive
+    # lowers it so turns are cheap (you take them at speed).
+    # 90-degree turn extra cost (cell units).
+    "planner_turn_cost":          1.0,
+    # 180-degree about-face extra cost.  Almost never useful -- the planner
+    # should turn around only when there's no alternative.
+    "planner_reverse_cost":       4.0,
+    # Extra cost for crossing an unknown wall.  Higher = more conservative
+    # about untrusted territory; the planner prefers known-open paths even
+    # when slightly longer.
+    "planner_unknown_cost":       0.5,
+
+    # --- Aggression label (informational; behaviour comes from the
+    # numeric tunables above set by a profile).  Echoed into the
+    # telemetry header so logs are self-identifying. -------------------
+    "aggression_mode":            "normal",
+
     # --- Sim-only (ignored on real hardware) -----------------------------
     "sim_wheel_tau_s":            0.04,    # 1st-order lag time constant
+    # Max integration substep inside SimClock.sleep().  At high commanded
+    # speeds, 5 ms substep lets the robot cover more than half its chassis
+    # radius before the collision check runs -- bring this down for race
+    # mode.  Default is safe up to ~3 m/s.
+    "sim_max_substep_s":          0.005,
 
     # --- Telemetry -------------------------------------------------------
     "telem_enabled":              True,

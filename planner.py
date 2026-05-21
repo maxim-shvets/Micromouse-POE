@@ -30,6 +30,7 @@ trade-off baked into `observe()`.
 CircuitPython-portable: no `@dataclass`, no `typing`, no f-strings.
 """
 
+import heapq
 import math
 
 
@@ -44,6 +45,24 @@ _DR = (1, 0, -1, 0)   # delta row per direction
 _OPPOSITE = (S, W, N, E)
 
 _INF_COST = 1 << 30
+
+
+def _turn_class(d_from, d_to):
+    """0 = straight, 1 = 90-deg turn, 2 = 180-deg about-face."""
+    if d_from == d_to:
+        return 0
+    if (d_from + 2) % 4 == d_to:
+        return 2
+    return 1
+
+
+def _turn_penalty(d_from, d_to, turn_cost, reverse_cost):
+    cls = _turn_class(d_from, d_to)
+    if cls == 0:
+        return 0.0
+    if cls == 2:
+        return reverse_cost
+    return turn_cost
 
 
 # -----------------------------------------------------------------------------
@@ -129,11 +148,12 @@ class KnownMap(object):
 # -----------------------------------------------------------------------------
 
 def flood_fill(known_map, goal_cell):
-    """BFS step-distance from `goal_cell` to every reachable cell.
+    """Plain BFS step-distance from `goal_cell` to every reachable cell.
 
     Unknown walls are treated as open.  Returns a 2D list `g` where
     `g[c][r]` is the step count from (c, r) to the goal, or `_INF_COST`
-    if disconnected.
+    if disconnected.  Kept as a reference implementation and for any
+    caller that wants the un-weighted heuristic.
     """
     cols = known_map.cols
     rows = known_map.rows
@@ -157,6 +177,73 @@ def flood_fill(known_map, goal_cell):
                 grid[nc][nr] = d_cur + 1
                 queue.append((nc, nr))
     return grid
+
+
+def flood_fill_weighted(known_map, goal_cell,
+                        turn_cost=1.0, reverse_cost=4.0, unknown_cost=0.5):
+    """Risk-weighted Dijkstra over (cell, facing_direction) states.
+
+    For each cell + facing direction, computes the minimum forward cost to
+    reach `goal_cell`.  Turning into a different direction costs
+    `turn_cost` (90 deg) or `reverse_cost` (180 deg) on top of the unit
+    move cost.  Crossing an unknown wall costs an extra `unknown_cost`
+    (unknowns are still treated as traversable -- the standard optimistic
+    flood-fill trick -- but with a risk premium so the planner prefers
+    known-open paths).
+
+    Args:
+        known_map:    `KnownMap`.
+        goal_cell:    (col, row).
+        turn_cost:    extra cost per 90-deg direction change.
+        reverse_cost: extra cost per 180-deg direction change.
+        unknown_cost: extra cost per crossing of an unknown wall.
+
+    Returns:
+        g[c][r][d] : optimal forward cost-to-goal for a robot at (c, r)
+                    facing direction `d`, `_INF_COST` if unreachable.
+
+    Notes:
+      - The expanded state space is 4 * cols * rows -- 1600 states at
+        20x20.  Dijkstra is comfortably under 1 ms for that on CPython.
+      - On CircuitPython, `heapq` is available in the standard build.
+    """
+    cols = known_map.cols
+    rows = known_map.rows
+    INF = _INF_COST
+    g = [[[INF, INF, INF, INF] for _ in range(rows)] for _ in range(cols)]
+
+    pq = []
+    gc, gr = goal_cell
+    # At the goal, any facing direction is fine -- cost 0.
+    for d in range(4):
+        g[gc][gr][d] = 0.0
+        heapq.heappush(pq, (0.0, gc, gr, d))
+
+    while pq:
+        cost, c, r, d = heapq.heappop(pq)
+        if cost > g[c][r][d]:
+            continue  # stale entry from a later better push
+
+        # Predecessor of (c, r, d) is a state (pc, pr, pd) from which the
+        # robot turned to face `d` and moved one cell to land at (c, r, d).
+        # So pc = c - DC[d], pr = r - DR[d], and pd is any of the four
+        # directions (the previous facing before the optional turn).
+        pc = c - _DC[d]
+        pr = r - _DR[d]
+        if not (0 <= pc < cols and 0 <= pr < rows):
+            continue
+        wall_state = known_map.walls[pc][pr][d]
+        if wall_state is True:
+            continue  # known wall blocks the move
+        unk = unknown_cost if wall_state is None else 0.0
+        for pd in range(4):
+            turn = _turn_penalty(pd, d, turn_cost, reverse_cost)
+            new_cost = cost + 1.0 + turn + unk
+            if new_cost < g[pc][pr][pd]:
+                g[pc][pr][pd] = new_cost
+                heapq.heappush(pq, (new_cost, pc, pr, pd))
+
+    return g
 
 
 # -----------------------------------------------------------------------------
@@ -189,18 +276,24 @@ class FloodFillPlanner(object):
     """
 
     def __init__(self, cols, rows, goal_cell, cell_size_m,
-                 sensor_forward_offset_m=0.03, wall_tolerance_m=0.05):
+                 sensor_forward_offset_m=0.03, wall_tolerance_m=0.05,
+                 turn_cost=1.0, reverse_cost=4.0, unknown_cost=0.5):
         self.cols = cols
         self.rows = rows
         self.goal_cell = (int(goal_cell[0]), int(goal_cell[1]))
         self.cell_size_m = float(cell_size_m)
         self.sensor_forward_offset_m = float(sensor_forward_offset_m)
         self.wall_tolerance_m = float(wall_tolerance_m)
+        # Risk-weighted-path cost factors.  See `flood_fill_weighted`.
+        self.turn_cost = float(turn_cost)
+        self.reverse_cost = float(reverse_cost)
+        self.unknown_cost = float(unknown_cost)
         self.map = KnownMap(cols, rows)
         # Expected side-ray distance when a side wall is present (and no
         # forward wall blocks the ray).  Position-independent because the
         # ray hits a wall line whose perpendicular offset is s/2.
         self._side_expected_m = self.cell_size_m / math.sqrt(2.0)
+        # `_dist[c][r][d]` is the optimal cost to goal from facing d at (c, r).
         self._dist = None
         self._dirty = True
         # Bookkeeping for telemetry / debugging.
@@ -304,24 +397,38 @@ class FloodFillPlanner(object):
     # ---- planning ---------------------------------------------------------
 
     def replan(self):
-        self._dist = flood_fill(self.map, self.goal_cell)
+        self._dist = flood_fill_weighted(
+            self.map, self.goal_cell,
+            turn_cost=self.turn_cost,
+            reverse_cost=self.reverse_cost,
+            unknown_cost=self.unknown_cost,
+        )
         self._dirty = False
         self.replan_count += 1
 
-    def cost(self, c, r):
-        """Step distance from (c, r) to the goal under the current map.
-        Returns `_INF_COST` if unreachable (treating unknowns as open)."""
+    def cost(self, c, r, facing=None):
+        """Cost-to-goal from (c, r).  If `facing` is given, returns the
+        cost for that arrival direction; else returns the best across all
+        four facings.  `_INF_COST` if unreachable (unknowns counted as open)."""
         if self._dirty or self._dist is None:
             self.replan()
-        return self._dist[c][r]
+        if facing is not None:
+            return self._dist[c][r][facing]
+        cell = self._dist[c][r]
+        return min(cell)
 
     def desired_heading(self, cell, current_heading):
-        """Return the cardinal direction with the lowest flood-fill cost.
+        """Pick the cardinal that minimises (turn + move + cost-to-goal).
 
-        Ties favour `current_heading` for stability -- this prevents
-        chattering between two equally-good options when the robot's
-        heading is mid-turn.  If every neighbour is walled, returns
-        `current_heading` so the controller can let recovery sort it out.
+        The Dijkstra cost map already accounts for turns *downstream* from
+        the next cell.  Here we add the turn cost from the current heading
+        to the candidate direction so the planner doesn't pick an
+        equal-cost path that requires turning right now over one that
+        keeps the robot going straight.
+
+        Ties favour `current_heading` (stability while mid-turn).  If
+        every neighbour is walled, returns `current_heading` so the
+        controller can let recovery sort it out.
         """
         if self._dirty or self._dist is None:
             self.replan()
@@ -330,7 +437,7 @@ class FloodFillPlanner(object):
             return current_heading
         best_d = None
         best_cost = _INF_COST
-        # Iterate in (current_heading first, then N,E,S,W) for tie-breaking.
+        # Iterate with current_heading first so ties resolve toward straight.
         order = [current_heading]
         for d in (N, E, S, W):
             if d != current_heading:
@@ -342,7 +449,11 @@ class FloodFillPlanner(object):
             nr = r + _DR[d]
             if not (0 <= nc < self.cols and 0 <= nr < self.rows):
                 continue
-            cost = self._dist[nc][nr]
+            wall_state = self.map.walls[c][r][d]
+            unk = self.unknown_cost if wall_state is None else 0.0
+            turn = _turn_penalty(current_heading, d,
+                                 self.turn_cost, self.reverse_cost)
+            cost = 1.0 + turn + unk + self._dist[nc][nr][d]
             if cost < best_cost:
                 best_cost = cost
                 best_d = d

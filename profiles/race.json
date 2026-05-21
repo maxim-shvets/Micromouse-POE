@@ -1,0 +1,18 @@
+{
+  "aggression_mode": "race",
+  "cruise_speed_mps": 2.0,
+  "max_speed_mps": 5.0,
+  "turn_speed_mps": 0.50,
+  "front_stop_m": 0.05,
+  "side_min_m": 0.025,
+  "max_decel_mps2": 8.0,
+  "max_wheel_accel_mps2": 20.0,
+  "wall_center_gain": 0.2,
+  "steer_gain": 0.3,
+  "planner_turn_cost": 0.3,
+  "planner_reverse_cost": 2.0,
+  "planner_unknown_cost": 0.2,
+  "loop_hz": 200.0,
+  "sim_max_substep_s": 0.0005,
+  "sensor_max_range_m": 2.0
+}

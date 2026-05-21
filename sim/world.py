@@ -222,11 +222,25 @@ class SimDrive(Drive):
 
 class SimClock(Clock):
     """Virtual clock -- `sleep(dt)` advances the world by dt and returns
-    immediately, so simulation runs as fast as the host can compute it."""
+    immediately, so simulation runs as fast as the host can compute it.
 
-    def __init__(self, world, max_substep_s=0.005):
+    Substep size matters for collision integrity at speed: the wall check
+    runs once per substep, so motion-per-substep must be less than the
+    chassis radius or the robot can teleport past a wall undetected.
+    Pulled from `Tunables.sim_max_substep_s` when the world carries one;
+    falls back to the explicit `max_substep_s` arg otherwise.
+    """
+
+    def __init__(self, world, max_substep_s=None):
         self.world = world
-        self.max_substep_s = max_substep_s
+        if max_substep_s is None:
+            # Prefer the world's tunable; fall back to a safe default.
+            t = getattr(world, "t_", None)
+            if t is not None and hasattr(t, "sim_max_substep_s"):
+                max_substep_s = t.sim_max_substep_s
+            else:
+                max_substep_s = 0.005
+        self.max_substep_s = float(max_substep_s)
 
     def now(self):
         return self.world.t

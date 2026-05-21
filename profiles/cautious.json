@@ -1,1 +1,14 @@
-{"cruise_speed_mps": 0.18, "front_stop_m": 0.08, "side_min_m": 0.045, "wall_center_gain": 0.6, "max_speed_mps": 0.3}
+{
+  "aggression_mode": "cautious",
+  "cruise_speed_mps": 0.18,
+  "max_speed_mps": 0.25,
+  "turn_speed_mps": 0.10,
+  "front_stop_m": 0.08,
+  "side_min_m": 0.045,
+  "max_decel_mps2": 1.0,
+  "max_wheel_accel_mps2": 3.0,
+  "wall_center_gain": 0.6,
+  "planner_turn_cost": 2.0,
+  "planner_reverse_cost": 6.0,
+  "planner_unknown_cost": 0.8
+}

@@ -201,7 +201,8 @@ class ReactiveController(object):
 
     STATE_NAMES = {0: "REACT", 1: "REVERSE", 2: "PIVOT"}
 
-    def __init__(self, tunables, planner=None, pose_provider=None):
+    def __init__(self, tunables, planner=None, pose_provider=None,
+                 estimator=None):
         """Args:
             tunables:       `Tunables`.
             planner:        Optional flood-fill planner (see `planner.py`).
@@ -211,13 +212,18 @@ class ReactiveController(object):
                             original reactive controller.
             pose_provider:  Required when `planner` is set.  Callable
                             returning the current world-frame pose
-                            (x, y, theta).  Sim wires it to SimWorld's
-                            ground truth; hardware wires it to an
-                            `EncoderOdometry` instance.
+                            (x, y, theta).  Sim ground-truth, or the
+                            `.pose` of a fused/SLAM estimator.
+            estimator:      Optional pose estimator (FusedOdometry or
+                            ScanMatchSlam).  When set, its `update()` is
+                            called at the top of each control tick so
+                            `pose_provider()` reads fresh state.  Leave
+                            None when using ground-truth pose.
         """
         self.t = tunables
         self.planner = planner
         self.pose_provider = pose_provider
+        self.estimator = estimator
         self._state = self._S_REACT
         self._state_t = 0.0       # time spent in current state
         self._stuck_t = 0.0       # accumulated stuck time in REACT
@@ -232,6 +238,9 @@ class ReactiveController(object):
         # Planner replan throttle and bookkeeping.
         self._planner_t = 0.0
         self._desired_heading = None
+        # Last per-tick IMU reading (set by step() when one is passed in).
+        # Exposed for telemetry / fusion / SLAM consumers.
+        self._last_imu_reading = None
 
     @property
     def state(self):
@@ -241,7 +250,25 @@ class ReactiveController(object):
     def stuck_t(self):
         return self._stuck_t
 
-    def step(self, reading, encoders, dt):
+    @property
+    def imu_reading(self):
+        """The most recent IMUReading the controller saw (None if no IMU)."""
+        return self._last_imu_reading
+
+    def step(self, reading, encoders, dt, imu_reading=None):
+        # Stash IMU first so any sub-stage (planner, future fusion/SLAM)
+        # and the telemetry recorder can read it via `controller.imu_reading`.
+        self._last_imu_reading = imu_reading
+        # If an estimator is wired, advance it before any pose_provider()
+        # call so the planner sees this tick's fresh state.  ScanMatchSlam
+        # accepts an extra `reading` kwarg; FusedOdometry ignores it.
+        if self.estimator is not None:
+            try:
+                self.estimator.update(encoders[0], encoders[1], dt,
+                                      imu_reading=imu_reading, reading=reading)
+            except TypeError:
+                self.estimator.update(encoders[0], encoders[1], dt,
+                                      imu_reading=imu_reading)
         self._state_t += dt
         T = self.t
 
@@ -422,7 +449,7 @@ class ReactiveController(object):
 # Top-level runner
 # -----------------------------------------------------------------------------
 
-def run(sensors, drive, clock, tunables, max_steps=None,
+def run(sensors, drive, clock, tunables, imu=None, max_steps=None,
         on_step=None, controller=None):
     """Spin the control loop.
 
@@ -431,6 +458,9 @@ def run(sensors, drive, clock, tunables, max_steps=None,
         drive:      `Drive` impl.
         clock:      `Clock` impl.
         tunables:   `Tunables`.
+        imu:        Optional `IMU` impl.  Polled once per tick and stashed
+                    on the controller; downstream consumers (telemetry,
+                    fusion, SLAM) read via `controller.imu_reading`.
         max_steps:  Stop after this many ticks (None = forever).
         on_step:    Optional callback(step_idx, reading, encoders, cmd,
                     controller) invoked each tick.
@@ -445,7 +475,8 @@ def run(sensors, drive, clock, tunables, max_steps=None,
         while max_steps is None or i < max_steps:
             reading = sensors.read()
             encoders = drive.read_encoders()
-            cmd = controller.step(reading, encoders, dt)
+            imu_r = imu.read() if imu is not None else None
+            cmd = controller.step(reading, encoders, dt, imu_reading=imu_r)
             drive.set_wheel_speeds(cmd)
             if on_step is not None:
                 on_step(i, reading, encoders, cmd, controller)

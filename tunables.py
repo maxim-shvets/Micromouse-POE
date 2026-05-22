@@ -116,6 +116,61 @@ _DEFAULTS = {
     # telemetry header so logs are self-identifying. -------------------
     "aggression_mode":            "normal",
 
+    # --- IMU (LSM6DS3TR-C on XIAO nRF52840 Sense; sim derives from
+    # kinematics with these noise + bias params layered on) --------------
+    # Accelerometer white-noise stdev in m/s^2.  LSM6DS3TR-C @ 2g is ~
+    # 0.04 m/s^2/sqrt(Hz) -> ~0.4 m/s^2 @ 100 Hz BW.  Conservative default.
+    "imu_noise_accel_mps2":       0.05,
+    # Gyroscope white-noise stdev in rad/s.  LSM6DS3TR-C @ 250 dps is
+    # ~0.007 rad/s/sqrt(Hz) -> ~0.07 rad/s @ 100 Hz BW.
+    "imu_noise_gyro_rps":         0.015,
+    # Constant gyro-z bias in rad/s.  Real boards have a non-zero offset
+    # at boot; the fusion layer estimates and subtracts it.  Sim defaults
+    # to a small non-zero value so the fusion code gets to demonstrate
+    # bias rejection.
+    "imu_bias_gyro_z_rps":        0.005,
+
+    # --- Pose fusion (encoder + gyro complementary filter) ---------------
+    # Weight on the gyro (high-freq) channel.  alpha in (0, 1); the
+    # encoder-odometry term gets weight (1 - alpha).  Higher = trust the
+    # gyro more (catches drift from wheel slip).  Sensible: 0.95-0.995.
+    "fusion_gyro_alpha":          0.98,
+    # Time constant for the bias estimator (s).  When the robot is moving
+    # slowly enough that wheel-encoder heading is reliable, the bias
+    # estimator drifts toward (gyro - encoder_rate).  Long tau = stable;
+    # short tau = adaptive.
+    "fusion_bias_tau_s":          20.0,
+
+    # --- Scan-matching SLAM (planner.KnownMap + ToF readings) ------------
+    # 0 disables SLAM; 1 fully replaces predicted pose with measured.
+    # 0.3 is a sensible compromise -- meaningful correction without
+    # overreacting to sensor noise.
+    "slam_correction_gain":       0.3,
+    # SLAM trusts a sensor channel only when the reading is at least this
+    # much shorter than max range (otherwise we're not seeing a wall at
+    # all and there's nothing to localise against).
+    "slam_min_clearance_m":       0.02,
+    # Maximum residual the SLAM step will trust.  A residual larger than
+    # this almost certainly means we're misaligned by a whole cell or the
+    # known map is wrong -- defer to dead reckoning.
+    "slam_max_residual_m":        0.08,
+    # Deadband: residuals smaller than this are treated as sensor noise
+    # and ignored.  Default = 2x sensor noise stdev along a 45-deg ray.
+    # Without this, SLAM corrections walk the pose around even when the
+    # dead-reckoning estimate is already accurate.
+    "slam_deadband_m":            0.008,
+    # SLAM updates only when |theta - cardinal| is below this.  Mid-pivot
+    # the side rays don't project cleanly onto cell walls.  Same logic
+    # as planner_observe_tol_rad but kept independent so each can be
+    # tuned without affecting the other.
+    "slam_observe_tol_rad":       0.15,
+
+    # --- Software PWM cap (DRV8833 thermal protection, from new spec) ----
+    # Maximum duty cycle the inner-loop wheel controller is allowed to
+    # request.  1.0 = no cap (default), 0.85 = 85% peak duty.  Useful as
+    # a safety net for sustained-stall scenarios.
+    "motor_duty_cap":             1.0,
+
     # --- Sim-only (ignored on real hardware) -----------------------------
     "sim_wheel_tau_s":            0.04,    # 1st-order lag time constant
     # Max integration substep inside SimClock.sleep().  At high commanded

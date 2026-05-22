@@ -72,6 +72,16 @@ class TelemetryRecorder(object):
             "stuck_t": _r3(controller.stuck_t),
             "recov": controller.recovery_count,
         }
+        # IMU fields are present iff an IMU was wired into algorithm.run
+        # this run; otherwise we omit them to keep the log small.
+        imu_r = getattr(controller, "imu_reading", None)
+        if imu_r is not None:
+            sample["ax"] = _r3(imu_r.accel_x)
+            sample["ay"] = _r3(imu_r.accel_y)
+            sample["az"] = _r3(imu_r.accel_z)
+            sample["wx"] = _r3(imu_r.gyro_x)
+            sample["wy"] = _r3(imu_r.gyro_y)
+            sample["wz"] = _r3(imu_r.gyro_z)
         if self.world is not None:
             sample["x"] = _r3(self.world.x)
             sample["y"] = _r3(self.world.y)

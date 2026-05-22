@@ -18,7 +18,7 @@ cruise.  Tune `max_wheel_accel_mps2` to match the bench measurement.
 import math
 import random
 
-from interfaces import RangeSensors, Drive, Clock, Reading
+from interfaces import RangeSensors, Drive, Clock, Reading, IMU, IMUReading
 
 
 _INF = float("inf")
@@ -218,6 +218,75 @@ class SimDrive(Drive):
 
     def read_encoders(self):
         return self.world.measured()
+
+
+class SimIMU(IMU):
+    """Virtual 6-axis IMU derived from the world kinematics state.
+
+    The robot is planar -- accel_z carries gravity, gyro_x and gyro_y are
+    pure noise.  The interesting channels are:
+
+        accel_x = dv/dt   (forward accel; spikes when the wheel model
+                           rate-limits during a step change)
+        accel_y = v * w   (centripetal lateral accel during turns; sign
+                           convention: left turn = w > 0 = a_y > 0)
+        gyro_z  = w       (yaw rate; what the fusion layer integrates)
+
+    On top of the ground-truth signal we layer:
+      - white noise (`imu_noise_accel_mps2`, `imu_noise_gyro_rps`)
+      - a constant gyro_z bias (`imu_bias_gyro_z_rps`) so the fusion code
+        gets a non-trivial bias-estimation problem to solve
+
+    The IMU must be read exactly once per control tick so its
+    differentiator (for accel_x) sees a consistent dt.  `algorithm.run`
+    polls it; everything else reads via `controller.imu_reading`.
+    """
+
+    GRAVITY_MPS2 = 9.81
+
+    def __init__(self, world, rng_seed=0xC0DECAFE):
+        self.world = world
+        import random
+        self._rng = random.Random(rng_seed)
+        self._prev_v = 0.0
+        self._prev_t = 0.0
+
+    def read(self):
+        W = self.world
+        T = W.t_
+        meas_l, meas_r = W._meas_left, W._meas_right
+        v = 0.5 * (meas_l + meas_r)
+        omega = (meas_r - meas_l) / T.wheel_base_m
+
+        now = W.t
+        dt = now - self._prev_t
+        if dt <= 0.0:
+            ax = 0.0
+        else:
+            ax = (v - self._prev_v) / dt
+        ay = v * omega        # centripetal lateral, +y = left turn
+        az = self.GRAVITY_MPS2
+
+        wx = 0.0
+        wy = 0.0
+        wz = omega
+
+        # Sensor model: white noise + constant gyro_z bias.
+        sa = T.imu_noise_accel_mps2
+        sg = T.imu_noise_gyro_rps
+        if sa > 0.0:
+            ax += self._rng.gauss(0.0, sa)
+            ay += self._rng.gauss(0.0, sa)
+            az += self._rng.gauss(0.0, sa)
+        if sg > 0.0:
+            wx += self._rng.gauss(0.0, sg)
+            wy += self._rng.gauss(0.0, sg)
+            wz += self._rng.gauss(0.0, sg)
+        wz += T.imu_bias_gyro_z_rps
+
+        self._prev_v = v
+        self._prev_t = now
+        return IMUReading(ax, ay, az, wx, wy, wz, timestamp=now)
 
 
 class SimClock(Clock):

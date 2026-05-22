@@ -29,7 +29,7 @@ import time
 
 from algorithm import run, ReactiveController
 from sim.maze import Maze
-from sim.world import SimWorld, SimSensors, SimDrive, SimClock
+from sim.world import SimWorld, SimSensors, SimDrive, SimClock, SimIMU
 from sim import render as render_mod
 from telemetry import TelemetryRecorder
 from tunables import Tunables, default_keys, default_value
@@ -101,6 +101,18 @@ def _parse_args(argv):
     p.add_argument("--planner", choices=("none", "flood_fill"), default="none",
                    help="enable the flood-fill planner above the reactive "
                         "controller (default: none -- legacy reactive-only)")
+    p.add_argument("--pose-source",
+                   choices=("ground_truth", "fused", "slam"),
+                   default="ground_truth",
+                   help="how the planner gets pose.  ground_truth: SimWorld "
+                        "(default; sim only).  fused: encoder + gyro "
+                        "complementary filter (FusedOdometry).  slam: fused "
+                        "+ ToF scan-match.  NOTE: in the sim, dead reckoning "
+                        "is essentially perfect, so 'slam' adds correction "
+                        "noise the planner mis-attributes -- prefer 'fused' "
+                        "for sim demos.  On real hardware where dead "
+                        "reckoning drifts, 'slam' (used by hardware/"
+                        "xiao_nrf52840.py::main) is the right choice.")
     return p.parse_args(argv)
 
 
@@ -142,26 +154,47 @@ def _build_tunables(args):
 def _build_controller(args, tun, world, maze):
     """Construct the controller, optionally wrapping the planner.
 
-    In sim we hand the planner ground-truth pose from `SimWorld`.  On real
-    hardware (`hardware/rp2040.py`) you'd wire `pose_provider` to an
-    `EncoderOdometry` instance integrating wheel encoders from the known
-    start cell.
+    `--pose-source` controls how the planner sees its pose:
+      ground_truth: SimWorld's known (x, y, theta).  Sim only.  Default.
+      fused:        encoder + gyro complementary filter (FusedOdometry).
+      slam:         fused + ToF scan-match against the planner's known
+                    map (ScanMatchSlam).  Matches the hardware path.
     """
     if args.planner == "none":
-        return ReactiveController(tun)
-    if args.planner == "flood_fill":
-        from planner import FloodFillPlanner
-        plan = FloodFillPlanner(
-            cols=maze.cols, rows=maze.rows,
-            goal_cell=maze.goal_cell,
-            cell_size_m=tun.planner_cell_size_m,
-            turn_cost=tun.planner_turn_cost,
-            reverse_cost=tun.planner_reverse_cost,
-            unknown_cost=tun.planner_unknown_cost,
-        )
+        return ReactiveController(tun), None
+    if args.planner != "flood_fill":
+        raise ValueError("Unknown planner: {}".format(args.planner))
+
+    from planner import FloodFillPlanner
+    plan = FloodFillPlanner(
+        cols=maze.cols, rows=maze.rows,
+        goal_cell=maze.goal_cell,
+        cell_size_m=tun.planner_cell_size_m,
+        turn_cost=tun.planner_turn_cost,
+        reverse_cost=tun.planner_reverse_cost,
+        unknown_cost=tun.planner_unknown_cost,
+    )
+
+    # Estimator owns the pose the planner sees.  Returns (controller, est).
+    estimator = None
+    if args.pose_source == "ground_truth":
         pose_provider = lambda: (world.x, world.y, world.theta)
-        return ReactiveController(tun, planner=plan, pose_provider=pose_provider)
-    raise ValueError("Unknown planner: {}".format(args.planner))
+    elif args.pose_source == "fused":
+        from pose_fusion import FusedOdometry
+        estimator = FusedOdometry(world.x, world.y, world.theta, tun)
+        pose_provider = estimator.pose
+    elif args.pose_source == "slam":
+        from slam import ScanMatchSlam
+        estimator = ScanMatchSlam(world.x, world.y, world.theta,
+                                  plan.map, tun)
+        pose_provider = estimator.pose
+    else:
+        raise ValueError("Unknown pose source: {}".format(args.pose_source))
+
+    return (ReactiveController(tun, planner=plan,
+                               pose_provider=pose_provider,
+                               estimator=estimator),
+            estimator)
 
 
 def main(argv=None):
@@ -185,8 +218,9 @@ def main(argv=None):
     sensors = SimSensors(world)
     drive = SimDrive(world)
     clock = SimClock(world)
+    imu = SimIMU(world)
 
-    controller = _build_controller(args, tun, world, maze)
+    controller, estimator = _build_controller(args, tun, world, maze)
 
     max_steps = int(args.sim_time * tun.loop_hz)
 
@@ -257,7 +291,8 @@ def main(argv=None):
     exit_code = 1
     exit_msg = "ran out of sim time"
     try:
-        run(sensors, drive, clock, tun, max_steps=max_steps, on_step=on_step,
+        run(sensors, drive, clock, tun, imu=imu,
+            max_steps=max_steps, on_step=on_step,
             controller=controller)
     except _Done as d:
         exit_code = d.code

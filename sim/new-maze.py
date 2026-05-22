@@ -40,8 +40,8 @@ _CORNERS = {
 
 
 class MazeGenerator:
-    def __init__(self, cols, rows, seed=None, start_corner='bl',
-                 loops=0.15, max_retries=100):
+    def __init__(self, cols, rows, cell_size_m=0.18, seed=None,
+                 start_corner='bl', loops=0.15, max_retries=100):
         if cols % 2 != 0 or rows % 2 != 0:
             raise ValueError("cols and rows must be even")
         if cols < 4 or rows < 4:
@@ -49,6 +49,9 @@ class MazeGenerator:
 
         self.cols = cols
         self.rows = rows
+        self.cell_size_m = float(cell_size_m)
+        self.width_m = cols * self.cell_size_m
+        self.height_m = rows * self.cell_size_m
         self.seed = seed
         self.start_corner = start_corner
         self.loops = loops
@@ -67,6 +70,7 @@ class MazeGenerator:
         co, ro, self.wall_to_add, self.exit_dir = _CORNERS[start_corner]
         self.start_c = co % cols
         self.start_r = ro % rows
+        self.start_cell = (self.start_c, self.start_r)
 
         # Generate with retry loop (re-seed on each retry)
         attempt_seed = seed
@@ -90,6 +94,10 @@ class MazeGenerator:
         else:
             raise RuntimeError(
                 f"Could not generate valid maze after {max_retries} attempts")
+
+        # goal_cell (singular) = the gateway cell — where the robot enters
+        gwc, gwr, _ = self.gateway
+        self.goal_cell = (gwc, gwr)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -301,6 +309,39 @@ class MazeGenerator:
                     break
 
         return False
+
+    # ------------------------------------------------------------------
+    # SimWorld compatibility (duck-type matches sim/maze.py Maze interface)
+    # ------------------------------------------------------------------
+
+    def cell_center(self, c, r):
+        """World-frame center of cell (c, r) in meters."""
+        s = self.cell_size_m
+        return (c * s + s / 2.0, r * s + s / 2.0)
+
+    def wall_segments(self):
+        """List of (x1, y1, x2, y2) wall segments in meters, de-duplicated."""
+        s = self.cell_size_m
+        segs = []
+        seen = set()
+
+        def add(x1, y1, x2, y2):
+            key = (round(x1, 6), round(y1, 6), round(x2, 6), round(y2, 6))
+            rkey = (round(x2, 6), round(y2, 6), round(x1, 6), round(y1, 6))
+            if key not in seen and rkey not in seen:
+                seen.add(key)
+                segs.append((x1, y1, x2, y2))
+
+        for c in range(self.cols):
+            for r in range(self.rows):
+                x0, y0 = c * s, r * s
+                x1, y1 = x0 + s, y0 + s
+                w = self.walls[c][r]
+                if w[0]: add(x0, y1, x1, y1)
+                if w[1]: add(x1, y0, x1, y1)
+                if w[2]: add(x0, y0, x1, y0)
+                if w[3]: add(x0, y0, x0, y1)
+        return segs
 
     # ------------------------------------------------------------------
     # Validation helper

@@ -98,6 +98,12 @@ def _parse_args(argv):
                    help="print raw run metrics alongside advice")
     p.add_argument("--list-tunables", action="store_true",
                    help="print all tunable keys + defaults and exit")
+    p.add_argument("--maze-algo", choices=("new", "sim"), default="new",
+                   help="maze generation algorithm: 'new' = competition-spec "
+                        "(new-maze.py, 2x2 center, corner start, anti-wall-hug; "
+                        "requires even cols/rows >= 4); "
+                        "'sim' = original recursive backtracker (sim/maze.py, "
+                        "any size in [3,20]). Default: new")
     p.add_argument("--planner", choices=("none", "flood_fill"), default="none",
                    help="enable the flood-fill planner above the reactive "
                         "controller (default: none -- legacy reactive-only)")
@@ -197,6 +203,36 @@ def _build_controller(args, tun, world, maze):
             estimator)
 
 
+def _build_maze(args):
+    """Construct the maze using the algorithm selected by --maze-algo."""
+    if args.maze_algo == "sim":
+        return Maze(args.cols, args.rows,
+                    cell_size_m=args.cell_size, seed=args.seed)
+
+    # "new" — competition-spec generator from sim/new-maze.py
+    import importlib.util
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "new_maze", os.path.join(here, "sim", "new-maze.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    if args.cols % 2 != 0 or args.rows % 2 != 0:
+        raise SystemExit(
+            "Error: --maze-algo new requires even --cols and --rows")
+    if args.cols < 4 or args.rows < 4:
+        raise SystemExit(
+            "Error: --maze-algo new requires --cols and --rows >= 4")
+
+    return mod.MazeGenerator(
+        cols=args.cols,
+        rows=args.rows,
+        cell_size_m=args.cell_size,
+        seed=args.seed,
+    )
+
+
 def main(argv=None):
     args = _parse_args(argv or sys.argv[1:])
 
@@ -208,7 +244,7 @@ def main(argv=None):
     if tun.diff():
         sys.stderr.write("tunables overrides: {}\n".format(tun.diff()))
 
-    maze = Maze(args.cols, args.rows, cell_size_m=args.cell_size, seed=args.seed)
+    maze = _build_maze(args)
     # The planner's cell-size tunable must match the maze actually being
     # driven.  Honour an explicit override (--tune planner_cell_size_m=...)
     # if the user set one; otherwise inherit from --cell-size.

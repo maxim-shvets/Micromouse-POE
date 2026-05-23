@@ -134,6 +134,12 @@ class SimWorld(object):
             self.y = new_y
             self.theta = new_theta
 
+        # Wrap heading into [-pi, pi] so downstream consumers (telemetry,
+        # visualizer, fusion midpoint integration) read sensible values
+        # regardless of how many revolutions have accumulated.
+        if self.theta > math.pi or self.theta < -math.pi:
+            self.theta = ((self.theta + math.pi) % (2.0 * math.pi)) - math.pi
+
         self.t += dt
         self.path.append((self.x, self.y))
 

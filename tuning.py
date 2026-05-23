@@ -192,6 +192,7 @@ def _metrics(samples, T):
         "frac_reverse":     reverse / n,
         "frac_pivot":       pivot / n,
         "pivot_in_react":   pivot_in_react / max(react, 1),
+        "recoveries":       recov,
         "recoveries_per_s": recov / duration,
         "collisions":       coll,
         "distance_m":       dist,
@@ -251,14 +252,37 @@ def _rule_collisions(m, T):
 
 def _rule_recoveries(m, T):
     rps = m["recoveries_per_s"]
-    if rps > 0.4:
+    if rps > 0.25:        # 15/min -- clearly looping
         sev = SEV_HIGH
-    elif rps > 0.15:
+    elif rps > 0.1:       # 6/min -- significant
         sev = SEV_MED
+    elif rps > 0.05:      # 3/min -- worth flagging
+        sev = SEV_LOW
     else:
         return None
     return Suggestion(sev, "front_stop_m", "UP", T.front_stop_m,
         "{:.2f} recoveries/s -- wedging at corners; raise stop threshold or wall_center_gain".format(rps))
+
+
+def _rule_slam_feedback_loop(m, T):
+    """High recovery rate combined with low distance-per-recovery suggests
+    the SLAM-pose feedback loop (Bug #29): the planner repeatedly tries
+    the same wrong direction after each recovery."""
+    rps = m["recoveries_per_s"]
+    if rps < 0.1 or m["distance_m"] < 0.3:
+        return None
+    dist_per_recov = m["distance_m"] / max(1, int(m.get("recoveries", 0) or
+                                                  rps * m["duration_s"]))
+    # Less than ~1 cell of progress between recoveries -> we're spinning,
+    # not navigating.
+    if dist_per_recov < 0.20:
+        return Suggestion(SEV_HIGH, "slam_correction_gain", "DOWN",
+                          T.slam_correction_gain,
+                          "{:.2f} recoveries/s, only {:.2f} m progress per recovery -- "
+                          "SLAM corrections may be feeding back into the planner's map; "
+                          "try lowering slam_correction_gain or switching --pose-source to "
+                          "fused/ground_truth".format(rps, dist_per_recov))
+    return None
 
 
 def _rule_track_err(m, T):
@@ -335,6 +359,7 @@ def _rule_tight_side_avg(m, T):
 _RULES = (
     _rule_collisions,
     _rule_recoveries,
+    _rule_slam_feedback_loop,
     _rule_track_err,
     _rule_speed_clipped,
     _rule_pivot_dominance,

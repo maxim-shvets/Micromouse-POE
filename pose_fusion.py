@@ -35,7 +35,8 @@ class FusedOdometry(object):
     """
 
     __slots__ = ("x", "y", "theta", "_t",
-                 "_bias_z", "_alpha", "_bias_tau",
+                 "_bias_z", "_alpha", "_bias_tau", "_bias_tau_warmup",
+                 "_bias_warmup_s", "_t_running",
                  "_wheel_base_m", "_initialised")
 
     def __init__(self, x0, y0, theta0, tunables):
@@ -50,6 +51,15 @@ class FusedOdometry(object):
         self._bias_z = tunables.imu_bias_gyro_z_rps
         self._alpha = tunables.fusion_gyro_alpha
         self._bias_tau = tunables.fusion_bias_tau_s
+        # Boot-time fast tau (see fusion_bias_warmup_*).  Bug #30 fix:
+        # race mode at 2 m/s covers a whole maze before the steady-state
+        # tau (~20 s) converges, so the early run accumulates lateral
+        # drift from un-corrected gyro bias.  Faster tau during the first
+        # few seconds fixes it without sacrificing long-run stability.
+        self._bias_tau_warmup = getattr(
+            tunables, "fusion_bias_warmup_tau_s", tunables.fusion_bias_tau_s)
+        self._bias_warmup_s = getattr(tunables, "fusion_bias_warmup_s", 0.0)
+        self._t_running = 0.0
         self._wheel_base_m = tunables.wheel_base_m
         self._initialised = False
 
@@ -57,6 +67,7 @@ class FusedOdometry(object):
         if dt <= 0.0:
             return
 
+        self._t_running += dt
         v = 0.5 * (left_mps + right_mps)
         omega_enc = (right_mps - left_mps) / self._wheel_base_m
 
@@ -73,7 +84,13 @@ class FusedOdometry(object):
             # encoder) into the bias estimate.  We gate on speed -- during
             # aggressive cornering encoder rate is unreliable.
             if abs(v) < 0.05 or abs(omega_enc) < 0.5:
-                tau = max(self._bias_tau, dt)
+                # Boot-time fast tau (Bug #30 fix) -- converges the bias
+                # estimate quickly during the first seconds of motion,
+                # then switches to the steady-state tau for stability.
+                if self._t_running < self._bias_warmup_s:
+                    tau = max(self._bias_tau_warmup, dt)
+                else:
+                    tau = max(self._bias_tau, dt)
                 w_obs = imu_reading.gyro_z - omega_enc
                 self._bias_z += (w_obs - self._bias_z) * (dt / tau)
         else:
@@ -85,6 +102,9 @@ class FusedOdometry(object):
         self.x += v * math.cos(self.theta) * dt
         self.y += v * math.sin(self.theta) * dt
         self.theta += 0.5 * omega * dt
+        # Wrap to [-pi, pi] so the value never blows up over many turns.
+        if self.theta > math.pi or self.theta < -math.pi:
+            self.theta = ((self.theta + math.pi) % (2.0 * math.pi)) - math.pi
         self._initialised = True
 
     def pose(self):

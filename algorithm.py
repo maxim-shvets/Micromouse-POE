@@ -202,7 +202,7 @@ class ReactiveController(object):
     STATE_NAMES = {0: "REACT", 1: "REVERSE", 2: "PIVOT"}
 
     def __init__(self, tunables, planner=None, pose_provider=None,
-                 estimator=None):
+                 estimator=None, observation_pose_provider=None):
         """Args:
             tunables:       `Tunables`.
             planner:        Optional flood-fill planner (see `planner.py`).
@@ -219,10 +219,21 @@ class ReactiveController(object):
                             called at the top of each control tick so
                             `pose_provider()` reads fresh state.  Leave
                             None when using ground-truth pose.
+            observation_pose_provider:
+                            Optional separate pose-provider for
+                            planner.observe() calls.  When wiring SLAM,
+                            pass `estimator.dead_reckoning_pose` here so
+                            wall observations are attributed to cells
+                            using a smooth (un-corrected) pose; small
+                            SLAM corrections at cell boundaries would
+                            otherwise flip the cell index and poison
+                            the known map (Bug #29).  Defaults to
+                            `pose_provider`.
         """
         self.t = tunables
         self.planner = planner
         self.pose_provider = pose_provider
+        self.observation_pose_provider = observation_pose_provider or pose_provider
         self.estimator = estimator
         self._state = self._S_REACT
         self._state_t = 0.0       # time spent in current state
@@ -241,6 +252,25 @@ class ReactiveController(object):
         # Last per-tick IMU reading (set by step() when one is passed in).
         # Exposed for telemetry / fusion / SLAM consumers.
         self._last_imu_reading = None
+        # Last commanded wheel speeds (for inter-tick rate limiting).
+        # Caps |cmd[t] - cmd[t-1]| to max_wheel_accel_mps2 * dt so the
+        # algorithm can't slam from cruise to pivot in one tick (which
+        # would heat the DRV8833 on real hardware; sim hides the issue).
+        self._last_cmd_l = 0.0
+        self._last_cmd_r = 0.0
+        # Adaptive-recovery state: a recovery that fires soon after the
+        # previous one (within `recovery_cluster_s`) is treated as part
+        # of the same "incident".  Each repeat tries a different escape
+        # strategy (flip pivot side, extend pivot duration).
+        self._consec_recoveries = 0
+        self._time_at_last_recovery = -1e9
+        # The latched recovery-pivot direction.  Set on REVERSE entry,
+        # flipped on consecutive recoveries.  +1 = CCW (right wheel
+        # forward), -1 = CW.
+        self._recovery_pivot_dir = +1
+        # Sim/wall-clock time accumulator the controller maintains
+        # privately (mirrors the planner's _planner_t).
+        self._sim_t = 0.0
 
     @property
     def state(self):
@@ -270,6 +300,7 @@ class ReactiveController(object):
                 self.estimator.update(encoders[0], encoders[1], dt,
                                       imu_reading=imu_reading)
         self._state_t += dt
+        self._sim_t += dt
         T = self.t
 
         if self._state == self._S_REACT:
@@ -298,22 +329,33 @@ class ReactiveController(object):
             return cmd
 
         if self._state == self._S_REVERSE:
-            if self._state_t >= T.reverse_time_s:
+            # Early exit if reverse is wedged: we're commanding backward
+            # motion but encoders confirm no motion happened.  Spending
+            # the full reverse_time_s pushing into a wall behind us is
+            # wasted budget; skip to PIVOT and try another angle.
+            if (self._state_t >= 0.5 * T.reverse_time_s
+                    and abs(encoders[0]) < T.stuck_speed_threshold_mps
+                    and abs(encoders[1]) < T.stuck_speed_threshold_mps):
+                self._enter(self._S_PIVOT)
+            elif self._state_t >= T.reverse_time_s:
                 self._enter(self._S_PIVOT)
             else:
                 s = T.turn_speed_mps
                 return WheelSpeeds(-s, -s)
 
         if self._state == self._S_PIVOT:
-            if self._state_t >= T.pivot_time_s:
+            # Third+ consecutive recovery in this incident -> stretch the
+            # pivot so we explore a bigger arc.  Bounded at 4x to keep
+            # the controller responsive.
+            stretch = min(self._consec_recoveries, 4)
+            pivot_window = T.pivot_time_s * stretch
+            if self._state_t >= pivot_window:
                 self._enter(self._S_REACT)
                 self._stuck_t = 0.0
                 return step(reading, encoders, T)
-            r = self._last_reading or reading
             s = T.turn_speed_mps
-            if r.left >= r.right:
-                return WheelSpeeds(-s, +s)
-            return WheelSpeeds(+s, -s)
+            d = self._recovery_pivot_dir
+            return WheelSpeeds(-d * s, +d * s)
 
         return WheelSpeeds(0.0, 0.0)
 
@@ -322,10 +364,58 @@ class ReactiveController(object):
         self._state_t = 0.0
         if new_state == self._S_REVERSE:
             self.recovery_count += 1
-            # Clear pivot state when escaping to recovery.
+            # Clear in-REACT pivot state when escaping to recovery.
             self._pivot_dir = 0
             self._pivot_t = 0.0
             self._pivot_total_t = 0.0
+            # Adaptive recovery: if this recovery fires soon after the
+            # previous one, treat it as a continuation of the same
+            # incident and try a different escape strategy.
+            recovery_cluster_s = max(2.0, 2.0 * self.t.reverse_time_s
+                                          + 2.0 * self.t.pivot_time_s)
+            since = self._sim_t - self._time_at_last_recovery
+            if since < recovery_cluster_s:
+                self._consec_recoveries += 1
+                # On every odd consecutive recovery, flip the pivot side.
+                if self._consec_recoveries % 2 == 1:
+                    self._recovery_pivot_dir = -self._recovery_pivot_dir
+            else:
+                # New incident -- pick direction based on the more-open
+                # side of the cached reading.
+                self._consec_recoveries = 1
+                if self._last_reading is not None:
+                    self._recovery_pivot_dir = (
+                        +1 if self._last_reading.left >= self._last_reading.right
+                        else -1)
+                else:
+                    self._recovery_pivot_dir = +1
+            self._time_at_last_recovery = self._sim_t
+
+    def _rate_limit(self, cmd, dt):
+        """Cap |cmd - last_cmd| per wheel to max_wheel_accel_mps2 * dt.
+
+        Prevents algorithm-level command discontinuities (e.g. from a
+        turn_speed pivot to a cruise_speed forward in a single tick) that
+        the DRV8833 inner-PI would translate into a thermal spike.  In
+        sim this matches what SimWorld already does to the actual wheel
+        speed; the difference is that the algorithm now SEES the limit.
+        """
+        a_max = self.t.max_wheel_accel_mps2
+        if a_max <= 0.0:
+            return cmd
+        step = a_max * dt
+        def clip(new, old):
+            d = new - old
+            if d > step:
+                return old + step
+            if d < -step:
+                return old - step
+            return new
+        nl = clip(cmd.left, self._last_cmd_l)
+        nr = clip(cmd.right, self._last_cmd_r)
+        self._last_cmd_l = nl
+        self._last_cmd_r = nr
+        return WheelSpeeds(nl, nr)
 
     def _apply_pivot_hysteresis(self, cmd, reading, dt):
         """If step() picked an in-place pivot, latch the direction.
@@ -402,9 +492,14 @@ class ReactiveController(object):
         progress_past_centre = forward_in_cell - 0.5 * s
 
         # Only update the map when reasonably well aligned with a cardinal.
+        # Use the OBSERVATION pose (smooth dead-reckoning when SLAM is wired)
+        # for cell-attribution.  See Bug #29 -- mm-scale SLAM corrections
+        # at cell boundaries flip the cell index and poison the map.
         if align_err < T.planner_observe_tol_rad:
             observe_sides = forward_in_cell >= 0.5 * s
-            self.planner.observe((x, y, theta), cell, heading, reading,
+            ox, oy, otheta = self.observation_pose_provider()
+            obs_cell = self.planner.pose_to_cell(ox, oy)
+            self.planner.observe((ox, oy, otheta), obs_cell, heading, reading,
                                  observe_sides=observe_sides)
 
         # Replan heartbeat (lazy replan inside the planner covers the rest).
@@ -477,6 +572,11 @@ def run(sensors, drive, clock, tunables, imu=None, max_steps=None,
             encoders = drive.read_encoders()
             imu_r = imu.read() if imu is not None else None
             cmd = controller.step(reading, encoders, dt, imu_reading=imu_r)
+            # Rate-limit at the algorithm/hardware boundary: caps the
+            # delta between this tick's command and last tick's to
+            # max_wheel_accel_mps2 * dt so the DRV8833 + N20 don't see
+            # step-input commands.  See ReactiveController._rate_limit.
+            cmd = controller._rate_limit(cmd, dt)
             drive.set_wheel_speeds(cmd)
             if on_step is not None:
                 on_step(i, reading, encoders, cmd, controller)

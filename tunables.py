@@ -140,30 +140,31 @@ _DEFAULTS = {
     # estimator drifts toward (gyro - encoder_rate).  Long tau = stable;
     # short tau = adaptive.
     "fusion_bias_tau_s":          20.0,
+    # Boot-time tau for the bias estimator: for the first
+    # `fusion_bias_warmup_s` seconds the estimator uses this shorter tau,
+    # then switches to `fusion_bias_tau_s`.  Lets the bias converge from
+    # 0 to its true value in a few seconds rather than ~20, so race-mode
+    # runs don't accumulate lateral drift before the bias settles.
+    "fusion_bias_warmup_tau_s":   2.0,
+    "fusion_bias_warmup_s":       3.0,
 
     # --- Scan-matching SLAM (planner.KnownMap + ToF readings) ------------
-    # 0 disables SLAM; 1 fully replaces predicted pose with measured.
-    # 0.3 is a sensible compromise -- meaningful correction without
-    # overreacting to sensor noise.
+    # Backward-compatible disable switch for the EKF.  Values above 0 no
+    # longer scale corrections; EKF trust comes from covariance + R/Q.
     "slam_correction_gain":       0.3,
-    # SLAM trusts a sensor channel only when the reading is at least this
-    # much shorter than max range (otherwise we're not seeing a wall at
-    # all and there's nothing to localise against).
+    # Legacy scalar-correction knobs kept for advisor/profile compatibility;
+    # the EKF uses the process/measurement noise and gate tunables below.
     "slam_min_clearance_m":       0.02,
-    # Maximum residual the SLAM step will trust.  A residual larger than
-    # this almost certainly means we're misaligned by a whole cell or the
-    # known map is wrong -- defer to dead reckoning.
     "slam_max_residual_m":        0.08,
-    # Deadband: residuals smaller than this are treated as sensor noise
-    # and ignored.  Default = 2x sensor noise stdev along a 45-deg ray.
-    # Without this, SLAM corrections walk the pose around even when the
-    # dead-reckoning estimate is already accurate.
     "slam_deadband_m":            0.008,
-    # SLAM updates only when |theta - cardinal| is below this.  Mid-pivot
-    # the side rays don't project cleanly onto cell walls.  Same logic
-    # as planner_observe_tol_rad but kept independent so each can be
-    # tuned without affecting the other.
     "slam_observe_tol_rad":       0.15,
+    "slam_process_noise_x":       1.0e-4,   # m^2 / s
+    "slam_process_noise_y":       1.0e-4,   # m^2 / s
+    "slam_process_noise_theta":   1.0e-5,   # rad^2 / s
+    "slam_measurement_noise":     9.0e-6,   # m^2 (sensor std ~3 mm)
+    "slam_gate_sigma":            3.0,      # Mahalanobis gate width
+    "slam_init_pos_var":          1.0e-4,
+    "slam_init_theta_var":        1.0e-6,
 
     # --- Software PWM cap (DRV8833 thermal protection, from new spec) ----
     # Maximum duty cycle the inner-loop wheel controller is allowed to

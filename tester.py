@@ -183,6 +183,7 @@ def _build_controller(args, tun, world, maze):
 
     # Estimator owns the pose the planner sees.  Returns (controller, est).
     estimator = None
+    observation_pose_provider = None
     if args.pose_source == "ground_truth":
         pose_provider = lambda: (world.x, world.y, world.theta)
     elif args.pose_source == "fused":
@@ -194,12 +195,16 @@ def _build_controller(args, tun, world, maze):
         estimator = ScanMatchSlam(world.x, world.y, world.theta,
                                   plan.map, tun)
         pose_provider = estimator.pose
+        # Wall-observation uses the smooth pre-correction pose so SLAM
+        # corrections at cell boundaries don't poison the map (Bug #29).
+        observation_pose_provider = estimator.dead_reckoning_pose
     else:
         raise ValueError("Unknown pose source: {}".format(args.pose_source))
 
     return (ReactiveController(tun, planner=plan,
                                pose_provider=pose_provider,
-                               estimator=estimator),
+                               estimator=estimator,
+                               observation_pose_provider=observation_pose_provider),
             estimator)
 
 

@@ -364,9 +364,15 @@ def main(tunables=None):
 
     def pose_provider():
         return estimator.pose()
+    # Bug #29 fix: planner.observe() uses the smooth pre-correction pose
+    # so mm-scale SLAM corrections at cell boundaries don't flip the cell
+    # index and poison the known map.
+    def observation_pose_provider():
+        return estimator.dead_reckoning_pose()
 
     controller = ReactiveController(
-        tunables, planner=planner, pose_provider=pose_provider)
+        tunables, planner=planner, pose_provider=pose_provider,
+        observation_pose_provider=observation_pose_provider)
 
     # We bypass the standard `algorithm.run` so we can interleave the
     # estimator's `update` between the controller step and the wheel

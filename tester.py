@@ -17,6 +17,28 @@ Usage:
   python3 tester.py --no-advice                    # skip tuning advisor
   python3 tester.py --list-tunables                # show all knobs
 
+XIAO performance emulation (CPU on the board is ~150-250x slower than
+the Mac running this sim):
+
+  # Path 1: projection only (cheap, no slowdown).  Multiplies measured
+  # tick time by the factor; reports overrun% in the run summary.
+  python3 tester.py --planner flood_fill --pose-source slam --mode race \\
+                    --tune cpu_slowdown_factor=200
+
+  # Path 2a: wall-clock emulation (slow, lets you watch the slowdown).
+  # Inserts time.sleep() per tick so the visualizer renders at the
+  # projected hardware pace.  DO NOT combine with Path 1 measurement --
+  # the sleeps inflate per-tick measurements via scheduler jitter.
+  python3 tester.py --viz matplotlib --planner flood_fill --mode race \\
+                    --tune cpu_slowdown_factor=20 \\
+                    --tune cpu_wallclock_emulate=true
+
+  # Path 2b (external alternative): system-level CPU throttling.  Affects
+  # the whole process; useful when you also want to throttle the
+  # visualizer + telemetry overhead.
+  #     brew install cpulimit
+  #     cpulimit -l 1 -- python3 tester.py --viz matplotlib ...
+
 Exit codes:
   0  reached goal
   1  ran out of sim time
@@ -107,6 +129,12 @@ def _parse_args(argv):
     p.add_argument("--planner", choices=("none", "flood_fill"), default="none",
                    help="enable the flood-fill planner above the reactive "
                         "controller (default: none -- legacy reactive-only)")
+    p.add_argument("--pre-map", action="store_true",
+                   help="pre-populate the planner's KnownMap with the maze's "
+                        "ground-truth walls before running.  Skips exploration; "
+                        "lets diagonal cuts fire immediately.  Useful for "
+                        "demonstrating race-phase behaviour after a previous "
+                        "explore run would have mapped the maze.")
     p.add_argument("--pose-source",
                    choices=("ground_truth", "fused", "slam"),
                    default="ground_truth",
@@ -179,6 +207,8 @@ def _build_controller(args, tun, world, maze):
         turn_cost=tun.planner_turn_cost,
         reverse_cost=tun.planner_reverse_cost,
         unknown_cost=tun.planner_unknown_cost,
+        use_diagonals=tun.planner_use_diagonals,
+        diagonal_strict=tun.planner_diagonal_strict,
     )
 
     # Estimator owns the pose the planner sees.  Returns (controller, est).
@@ -201,6 +231,16 @@ def _build_controller(args, tun, world, maze):
     else:
         raise ValueError("Unknown pose source: {}".format(args.pose_source))
 
+    if tun.controller_mode == "path":
+        from path_controller import PathController
+        return (PathController(tun, planner=plan,
+                               pose_provider=pose_provider,
+                               estimator=estimator,
+                               observation_pose_provider=observation_pose_provider),
+                estimator)
+    if tun.controller_mode != "cell":
+        raise ValueError("Unknown controller_mode: {}".format(
+            tun.controller_mode))
     return (ReactiveController(tun, planner=plan,
                                pose_provider=pose_provider,
                                estimator=estimator,
@@ -262,6 +302,20 @@ def main(argv=None):
     imu = SimIMU(world)
 
     controller, estimator = _build_controller(args, tun, world, maze)
+
+    # --pre-map: copy ground-truth maze walls into the planner's KnownMap
+    # so the run starts as if exploration is already complete.  Enables
+    # immediate diagonal cuts for the race-phase demo.  Only meaningful
+    # when --planner=flood_fill (otherwise there's no planner to seed).
+    if args.pre_map and controller.planner is not None:
+        plan = controller.planner
+        for c in range(maze.cols):
+            for r in range(maze.rows):
+                for d in range(4):
+                    w = maze.walls[c][r][d]
+                    if w is not None:
+                        plan.map.set_wall(c, r, d, bool(w))
+        plan.replan()
 
     max_steps = int(args.sim_time * tun.loop_hz)
 
@@ -370,6 +424,30 @@ def main(argv=None):
         world.distance_traveled / world.t if world.t > 0 else 0.0))
     print("maze          : {}x{} cells @ {:.2f} m, seed={}".format(
         args.cols, args.rows, args.cell_size, args.seed))
+
+    if controller.planner is not None:
+        plan = controller.planner
+        if tun.planner_use_diagonals:
+            print("diagonals     : {} offered / {} taken{}".format(
+                plan.diagonals_offered, plan.diagonals_taken,
+                "" if plan.diagonals_offered
+                else "  (no open 2x2 corners on the path)"))
+
+    perf = controller.perf_summary()
+    if perf:
+        print()
+        print("---- perf (Path 1: tick-budget projection) ----")
+        print("loop rate     : {:.0f} Hz  (budget {:.0f} us/tick)".format(
+            tun.loop_hz, perf["budget_us"]))
+        print("slowdown      : {:.1f}x  (1.0 = no emulation, projection == measured)".format(
+            perf["slowdown"]))
+        print("ticks         : {}".format(perf["ticks"]))
+        print("mac avg/max   : {:7.1f} us / {:7.1f} us".format(
+            perf["avg_us"], perf["max_us"]))
+        print("proj avg/max  : {:7.1f} us / {:7.1f} us".format(
+            perf["avg_proj_us"], perf["max_proj_us"]))
+        print("overruns      : {} / {}  ({:.1f}%)".format(
+            perf["overrun_count"], perf["ticks"], perf["overrun_pct"]))
 
     if recorder is not None and not args.no_advice:
         print()

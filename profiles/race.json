@@ -12,7 +12,9 @@
   "planner_turn_cost": 0.3,
   "planner_reverse_cost": 2.0,
   "planner_unknown_cost": 0.2,
+  "planner_use_diagonals": true,
   "loop_hz": 200.0,
   "sim_max_substep_s": 0.0005,
-  "sensor_max_range_m": 2.0
+  "sensor_max_range_m": 2.0,
+  "controller_mode": "path"
 }

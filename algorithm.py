@@ -38,7 +38,45 @@ about magic numbers.
 CircuitPython-portable: no `typing`, no `@dataclass`, no f-strings.
 """
 
+import time
+
 from interfaces import WheelSpeeds
+
+
+# -----------------------------------------------------------------------------
+# Portable microsecond timer.  Three runtimes to support:
+#   CPython 3.7+         -- time.monotonic_ns (ns precision)
+#   CircuitPython 4.0+   -- time.monotonic    (float seconds)
+#   MicroPython          -- time.ticks_us + time.ticks_diff (wrap-aware)
+# Used by `run()` to measure per-tick controller work for the Path-1
+# tick-budget instrumentation.
+# -----------------------------------------------------------------------------
+
+if hasattr(time, "monotonic_ns"):
+    def _perf_now_us():
+        return time.monotonic_ns() / 1000.0
+
+    def _perf_diff_us(end, start):
+        return end - start
+elif hasattr(time, "monotonic"):
+    def _perf_now_us():
+        return time.monotonic() * 1e6
+
+    def _perf_diff_us(end, start):
+        return end - start
+elif hasattr(time, "ticks_us"):
+    _perf_now_us = time.ticks_us  # type: ignore[attr-defined]
+    _ticks_diff = time.ticks_diff  # type: ignore[attr-defined]
+
+    def _perf_diff_us(end, start):
+        return _ticks_diff(end, start)
+else:
+    # No timer available -- degrade gracefully (no instrumentation).
+    def _perf_now_us():
+        return 0.0
+
+    def _perf_diff_us(end, start):
+        return 0.0
 
 
 # -----------------------------------------------------------------------------
@@ -249,6 +287,11 @@ class ReactiveController(object):
         # Planner replan throttle and bookkeeping.
         self._planner_t = 0.0
         self._desired_heading = None
+        # When the planner offers a diagonal cut, the controller latches
+        # the target until the robot arrives at the cell center.  Tuple:
+        # (world_x, world_y, target_theta, target_cell).  None = cardinal
+        # mode (default).  See `_planner_diagonal_step`.
+        self._diagonal_target = None
         # Last per-tick IMU reading (set by step() when one is passed in).
         # Exposed for telemetry / fusion / SLAM consumers.
         self._last_imu_reading = None
@@ -271,6 +314,21 @@ class ReactiveController(object):
         # Sim/wall-clock time accumulator the controller maintains
         # privately (mirrors the planner's _planner_t).
         self._sim_t = 0.0
+        # Path-1 perf instrumentation.  algorithm.run() times the
+        # controller.step()+_rate_limit() span and feeds each result
+        # back through `_perf_tick()`.  The aggregates project to the
+        # XIAO via cpu_slowdown_factor and compare against perf_budget_us
+        # (which defaults to 1e6/loop_hz).  No effect on physics; purely
+        # diagnostic.
+        self._perf_tick_count = 0
+        self._perf_overrun_count = 0
+        self._perf_total_us = 0.0
+        self._perf_max_us = 0.0
+        self._perf_total_projected_us = 0.0
+        self._perf_max_projected_us = 0.0
+        self._perf_last_us = 0.0
+        self._perf_last_projected_us = 0.0
+        self._perf_last_overrun = False
 
     @property
     def state(self):
@@ -417,6 +475,79 @@ class ReactiveController(object):
         self._last_cmd_r = nr
         return WheelSpeeds(nl, nr)
 
+    # -- perf instrumentation (Path 1) ---------------------------------------
+
+    def _perf_tick(self, measured_us):
+        """Record one tick's measured CPU time and project to target MCU.
+
+        Called from algorithm.run() with the wall-clock microseconds taken
+        by controller.step()+_rate_limit() on the host (Mac CPython).  The
+        projection multiplies by `cpu_slowdown_factor` so we can ask:
+        "would this tick fit in budget on the XIAO?"  Each call updates
+        the rolling aggregates; `perf_summary()` exposes them.
+
+        No-op semantics if cpu_slowdown_factor == 1.0: measured == projected
+        and overrun is judged against the same budget.
+        """
+        T = self.t
+        factor = T.cpu_slowdown_factor
+        if factor < 1.0:
+            factor = 1.0
+        projected_us = measured_us * factor
+        budget_us = T.perf_budget_us
+        if budget_us <= 0.0:
+            budget_us = 1e6 / T.loop_hz
+        over = projected_us > budget_us
+
+        self._perf_tick_count += 1
+        self._perf_total_us += measured_us
+        self._perf_total_projected_us += projected_us
+        if measured_us > self._perf_max_us:
+            self._perf_max_us = measured_us
+        if projected_us > self._perf_max_projected_us:
+            self._perf_max_projected_us = projected_us
+        if over:
+            self._perf_overrun_count += 1
+        self._perf_last_us = measured_us
+        self._perf_last_projected_us = projected_us
+        self._perf_last_overrun = over
+
+    def perf_summary(self):
+        """Return a dict of aggregated perf stats, or {} if no ticks ran.
+
+        Keys:
+            ticks            -- total ticks measured
+            budget_us        -- per-tick budget (from perf_budget_us or
+                                derived from loop_hz)
+            slowdown         -- cpu_slowdown_factor used
+            avg_us / max_us  -- measured host CPU time per tick
+            avg_proj_us / max_proj_us -- projected MCU time per tick
+            overrun_count    -- ticks where projected > budget
+            overrun_pct      -- overrun_count / ticks * 100
+        """
+        if self._perf_tick_count == 0:
+            return {}
+        T = self.t
+        budget_us = T.perf_budget_us
+        if budget_us <= 0.0:
+            budget_us = 1e6 / T.loop_hz
+        n = self._perf_tick_count
+        return {
+            "ticks": n,
+            "budget_us": budget_us,
+            "slowdown": T.cpu_slowdown_factor,
+            "avg_us": self._perf_total_us / n,
+            "max_us": self._perf_max_us,
+            "avg_proj_us": self._perf_total_projected_us / n,
+            "max_proj_us": self._perf_max_projected_us,
+            "overrun_count": self._perf_overrun_count,
+            "overrun_pct": 100.0 * self._perf_overrun_count / n,
+        }
+
+    @property
+    def perf_last_overrun(self):
+        return self._perf_last_overrun
+
     def _apply_pivot_hysteresis(self, cmd, reading, dt):
         """If step() picked an in-place pivot, latch the direction.
 
@@ -455,14 +586,16 @@ class ReactiveController(object):
 
         Each tick:
           1. Pull pose from `pose_provider` and resolve current cell + heading.
-          2. If aligned with a cardinal, let the planner record walls from
+          2. If a diagonal cut is in progress, drive toward its target cell
+             and return; diagonals are not interrupted mid-flight.
+          3. If aligned with a cardinal, let the planner record walls from
              the current ToF reading.
-          3. If at-or-past the cell centre along the current heading, ask
-             the planner for the next cardinal.  Before centre, commit to
-             the current heading -- turning mid-cell would leave the robot
-             off-axis in the perpendicular dimension and clip the next
-             cell's walls.
-          4. Issue motion -- in-place pivot when mis-aligned, else forward.
+          4. If at-or-past the cell centre along the current heading, ask
+             the planner for the next motion (cardinal OR diagonal).  Before
+             centre, commit to the current heading -- turning mid-cell would
+             leave the robot off-axis in the perpendicular dimension and
+             clip the next cell's walls.
+          5. Issue motion -- in-place pivot when mis-aligned, else forward.
 
         The reactive layer's stuck detection + REVERSE/PIVOT recovery still
         wraps this (see `step()`), so a surprise wall mid-cell still gets
@@ -471,6 +604,15 @@ class ReactiveController(object):
         from planner import (theta_from_heading, heading_from_theta, wrap_pi)
         T = self.t
         x, y, theta = self.pose_provider()
+
+        # Diagonal mode takes precedence: once committed, drive to the
+        # target cell center without observing or re-planning.  This is a
+        # race optimisation -- the maze should be well-mapped before
+        # diagonals fire, and a 45-deg ray-trace doesn't map cleanly onto
+        # cell walls so observation would poison the map.
+        if self._diagonal_target is not None:
+            return self._planner_diagonal_step(reading, x, y, theta, T)
+
         cell = self.planner.pose_to_cell(x, y)
         heading = heading_from_theta(theta)
         cardinal_theta = theta_from_heading(heading)
@@ -509,11 +651,36 @@ class ReactiveController(object):
             if self.planner._dirty or self.planner._dist is None:
                 self.planner.replan()
 
-        # Pick a heading.  Decisions only happen at or past cell centre --
-        # before centre, commit to the current heading so we don't end up
-        # off-axis when the next cell's wall geometry takes over.
-        if progress_past_centre >= 0.0:
-            desired = self.planner.desired_heading(cell, heading)
+        # Tangent-arc trigger point.  For pure pivot (arc_turn_v_mps=0)
+        # this equals cell center -- legacy "decide at cell center" path.
+        # For arc turning, the arc starts r metres BEFORE cell center so
+        # the arc's midpoint lands on the cell center diagonal -- robot
+        # enters at (cell_x, cell_y - r) heading N, exits at (cell_x + r,
+        # cell_y) heading E.  Both endpoints sit on the perpendicular
+        # cell-center axes, so the next straight segment is automatically
+        # axis-aligned and no lateral drift accumulates across turns.
+        arc_r = self._arc_radius(T)
+        arc_start_fwd = 0.5 * s - arc_r
+        progress_past_arc_start = forward_in_cell - arc_start_fwd
+
+        # Pick a heading.  We commit to a cardinal turn at arc-start (which
+        # is earlier than cell centre when arc_turn_v_mps>0).  Diagonals
+        # still wait for cell centre -- they're a per-cell commit to a
+        # full 1.4-cell cut and benefit from the robot being centered.
+        if progress_past_arc_start >= 0.0:
+            motion = self.planner.desired_motion(cell, heading)
+            if motion[0] == 'diagonal':
+                # Diagonals are unchanged: wait until cell centre.
+                if progress_past_centre >= 0.0:
+                    _, target_theta_diag, target_cell = motion
+                    wx, wy = self.planner.cell_center_xy(*target_cell)
+                    self._diagonal_target = (wx, wy, target_theta_diag, target_cell)
+                    self.planner.diagonals_taken += 1
+                    self._desired_heading = None
+                    return self._planner_diagonal_step(reading, x, y, theta, T)
+                desired = heading
+            else:
+                desired = motion[1]
         else:
             desired = heading
         self._desired_heading = desired
@@ -521,15 +688,155 @@ class ReactiveController(object):
         err = wrap_pi(target_theta - theta)
 
         if abs(err) > T.planner_turn_threshold_rad:
-            # In-place pivot toward target heading.
-            s_turn = T.turn_speed_mps
-            if err > 0.0:
-                return WheelSpeeds(-s_turn, +s_turn)  # CCW
-            return WheelSpeeds(+s_turn, -s_turn)      # CW
+            # Turn toward target heading.  Pure pivot when
+            # arc_turn_v_mps=0, otherwise a forward-arc that shaves the
+            # stop-and-restart penalty off every planner turn.
+            return self._planner_turn_command(err, reading, T)
 
         # Aligned -- drive forward, risk-aware.  A small heading-error
         # P-correction bleeds residual `err` off without flipping back to
         # full pivot (err is bounded here by planner_turn_threshold_rad).
+        base = _safe_forward_speed(reading.front, T)
+        # Pre-turn deceleration: cap cruise so the rate limiter can bring
+        # us to the arc/pivot speed before the next turn point.  Without
+        # this, race-mode cruise overshoots cell boundaries by 1+ cells
+        # because the wheels can't decelerate fast enough.  See
+        # `cells_to_next_turn` -- O(few) per tick, negligible cost.
+        base = self._brake_for_next_turn(base, cell, desired,
+                                         forward_in_cell, T)
+        # Heading-error P-correction (positive bias = need CCW).
+        hdg_bias = T.steer_gain * err
+        # Wall-centering pull: only when arc turning is enabled.  Arc
+        # turns can leave the robot slightly off-axis; wall-centering
+        # pulls it back between turns.  In legacy stop-and-pivot mode
+        # the robot is always cell-axis-aligned right after the pivot,
+        # so wall-centering only adds noise (it conflicts with the
+        # heading-correction in mid-cell observations).
+        if T.arc_turn_v_mps > 0.0:
+            wall_bias = _wall_center_bias(reading.left, reading.right, T)
+            bias = hdg_bias - wall_bias
+        else:
+            bias = hdg_bias
+        max_bias = 0.5
+        if bias > max_bias:
+            bias = max_bias
+        elif bias < -max_bias:
+            bias = -max_bias
+        return WheelSpeeds(base * (1.0 - bias), base * (1.0 + bias))
+
+    def _brake_for_next_turn(self, v_cruise, cell, heading, forward_in_cell, T):
+        """Cap forward speed so we can decelerate to arc/pivot by the turn.
+
+        Physics: starting at v0 and decelerating at a, we reach v_target
+        after covering (v0^2 - v_target^2) / (2a) metres.  Solving for
+        the maximum v0 that still fits in distance `d`:
+
+            v_max(d) = sqrt(v_target^2 + 2 * a * d)
+
+        Target point: the arc-start, which is `arc_r` metres before the
+        apex cell's centre when v_arc > 0 (tangent-arc geometry), or the
+        apex cell's centre for pure pivot.  Distance to it:
+
+            d = (n + 0.5) * cell_size - forward_in_cell - arc_r
+
+        where `n` is `cells_to_next_turn` (lookahead, planner-driven).
+        """
+        import math
+        n = self.planner.cells_to_next_turn(cell, heading)
+        v_target = T.arc_turn_v_mps if T.arc_turn_v_mps > 0.0 else 0.0
+        arc_r = self._arc_radius(T)
+        d = (n + 0.5) * T.planner_cell_size_m - forward_in_cell - arc_r
+        if d <= 0.0:
+            d = 0.0
+        v_max = math.sqrt(v_target * v_target + 2.0 * T.max_decel_mps2 * d)
+        if v_max < v_cruise:
+            return v_max
+        return v_cruise
+
+    # -- planner-driven REACT, turn execution helper --------------------------
+
+    def _arc_radius(self, T):
+        """Geometric radius of the planner-arc, in metres.  0 if no arc.
+
+        Uses `arc_turn_omega_rps` when set (decoupled mode), otherwise
+        falls back to omega = 2 * turn_speed_mps / wheel_base_m (legacy
+        same-rate-as-pivot).
+        """
+        v_arc = T.arc_turn_v_mps
+        if v_arc <= 0.0:
+            return 0.0
+        if T.arc_turn_omega_rps > 0.0:
+            return v_arc / T.arc_turn_omega_rps
+        return v_arc * T.wheel_base_m / (2.0 * T.turn_speed_mps)
+
+    def _planner_turn_command(self, err, reading, T):
+        """Build a wheel command that turns toward `err` heading offset.
+
+        Returns either a pure pivot (legacy behaviour, used when
+        arc_turn_v_mps is 0 or |err| is too large for safe arc) or an
+        arc: forward at `arc_turn_v_mps` while rotating at omega.
+
+        Omega selection:
+          arc_turn_omega_rps > 0 -> use it directly (decoupled from
+                                    legacy turn_speed_mps).
+          otherwise              -> omega = 2 * turn_speed_mps /
+                                    wheel_base_m  (legacy: same rate as
+                                    in-place pivot).
+
+        Forward velocity is clamped by `_safe_forward_speed` so an arc
+        into a wall degrades to a pivot before contact.
+        """
+        v_arc = T.arc_turn_v_mps
+        if v_arc <= 0.0 or abs(err) > T.arc_turn_max_err_rad:
+            # Pure pivot: legacy turn_speed_mps.
+            s_turn = T.turn_speed_mps
+            if err > 0.0:
+                return WheelSpeeds(-s_turn, +s_turn)  # CCW
+            return WheelSpeeds(+s_turn, -s_turn)      # CW
+        # Cap by forward clearance so we don't arc into a wall.
+        v_safe = _safe_forward_speed(reading.front, T)
+        if v_arc > v_safe:
+            v_arc = v_safe
+        # Choose omega: decoupled if arc_turn_omega_rps > 0, else legacy.
+        if T.arc_turn_omega_rps > 0.0:
+            omega = T.arc_turn_omega_rps
+        else:
+            omega = 2.0 * T.turn_speed_mps / T.wheel_base_m
+        s_diff = omega * T.wheel_base_m / 2.0   # half-difference per wheel
+        if err > 0.0:
+            return WheelSpeeds(v_arc - s_diff, v_arc + s_diff)  # CCW
+        return WheelSpeeds(v_arc + s_diff, v_arc - s_diff)      # CW
+
+    # -- planner-driven REACT, diagonal branch --------------------------------
+
+    def _planner_diagonal_step(self, reading, x, y, theta, T):
+        """Drive toward a latched diagonal target.
+
+        Same shape as the cardinal drive branch but with the target
+        theta coming from `_diagonal_target` (45-deg off cardinal)
+        instead of a heading enum, and arrival measured as Euclidean
+        distance to the destination cell's center.
+
+        When the robot is within `planner_diagonal_arrive_frac * cell_size`
+        of the target, clear the latch.  The next tick re-enters
+        `_planner_step` proper and gets a fresh cardinal-or-diagonal
+        decision from the planner.  We return WheelSpeeds(0, 0) on that
+        arrival tick so the rate limiter has one cycle to brake before
+        the next motion -- the freeze is one dt (5 ms at race mode), so
+        it's not visible in trajectory.
+        """
+        from planner import wrap_pi
+        wx, wy, target_theta, _target_cell = self._diagonal_target
+        dx = wx - x
+        dy = wy - y
+        d_sq = dx * dx + dy * dy
+        arrive_r = T.planner_cell_size_m * T.planner_diagonal_arrive_frac
+        if d_sq < arrive_r * arrive_r:
+            self._diagonal_target = None
+            return WheelSpeeds(0.0, 0.0)
+        err = wrap_pi(target_theta - theta)
+        if abs(err) > T.planner_turn_threshold_rad:
+            return self._planner_turn_command(err, reading, T)
         base = _safe_forward_speed(reading.front, T)
         bias = T.steer_gain * err
         max_bias = 0.5
@@ -571,12 +878,31 @@ def run(sensors, drive, clock, tunables, imu=None, max_steps=None,
             reading = sensors.read()
             encoders = drive.read_encoders()
             imu_r = imu.read() if imu is not None else None
+            # Path-1 perf instrumentation.  Time only the CPU-bound
+            # work (controller.step + rate-limit) -- NOT sensor/IMU/drive
+            # I/O, which on hardware is I2C-bound and doesn't scale with
+            # cpu_slowdown_factor.  See `_perf_now_us` polyfill above.
+            _t_perf0 = _perf_now_us()
             cmd = controller.step(reading, encoders, dt, imu_reading=imu_r)
             # Rate-limit at the algorithm/hardware boundary: caps the
             # delta between this tick's command and last tick's to
             # max_wheel_accel_mps2 * dt so the DRV8833 + N20 don't see
             # step-input commands.  See ReactiveController._rate_limit.
             cmd = controller._rate_limit(cmd, dt)
+            _t_perf1 = _perf_now_us()
+            _measured_us = _perf_diff_us(_t_perf1, _t_perf0)
+            controller._perf_tick(_measured_us)
+            # Path-2 wall-clock emulation.  When enabled, sleep the
+            # difference between measured and projected per-tick time so
+            # the wall-clock pacing matches the projected MCU.  Has no
+            # effect on the simulated trajectory (which uses sim time via
+            # clock.sleep below) -- only the matplotlib visualizer and
+            # any external observers see the slowdown.  Skipped when the
+            # extra delay would be negative or zero.
+            if tunables.cpu_wallclock_emulate:
+                _extra_us = _measured_us * (tunables.cpu_slowdown_factor - 1.0)
+                if _extra_us > 0.0:
+                    time.sleep(_extra_us * 1e-6)
             drive.set_wheel_speeds(cmd)
             if on_step is not None:
                 on_step(i, reading, encoders, cmd, controller)

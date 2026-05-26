@@ -356,6 +356,8 @@ def main(tunables=None):
         turn_cost=tunables.planner_turn_cost,
         reverse_cost=tunables.planner_reverse_cost,
         unknown_cost=tunables.planner_unknown_cost,
+        use_diagonals=tunables.planner_use_diagonals,
+        diagonal_strict=tunables.planner_diagonal_strict,
     )
     # Start centred in cell (0, 0), facing N.
     s = tunables.planner_cell_size_m
@@ -370,9 +372,15 @@ def main(tunables=None):
     def observation_pose_provider():
         return estimator.dead_reckoning_pose()
 
-    controller = ReactiveController(
-        tunables, planner=planner, pose_provider=pose_provider,
-        observation_pose_provider=observation_pose_provider)
+    if tunables.controller_mode == "path":
+        from path_controller import PathController
+        controller = PathController(
+            tunables, planner=planner, pose_provider=pose_provider,
+            observation_pose_provider=observation_pose_provider)
+    else:
+        controller = ReactiveController(
+            tunables, planner=planner, pose_provider=pose_provider,
+            observation_pose_provider=observation_pose_provider)
 
     # We bypass the standard `algorithm.run` so we can interleave the
     # estimator's `update` between the controller step and the wheel

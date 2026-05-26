@@ -69,8 +69,11 @@ def _build_controller(pose_source, tun, world, maze):
         turn_cost=tun.planner_turn_cost,
         reverse_cost=tun.planner_reverse_cost,
         unknown_cost=tun.planner_unknown_cost,
+        use_diagonals=tun.planner_use_diagonals,
+        diagonal_strict=tun.planner_diagonal_strict,
     )
     estimator = None
+    observation_pose_provider = None
     if pose_source == "ground_truth":
         pose_provider = lambda: (world.x, world.y, world.theta)
     elif pose_source == "fused":
@@ -80,19 +83,30 @@ def _build_controller(pose_source, tun, world, maze):
     elif pose_source == "slam":
         from slam import ScanMatchSlam
         estimator = ScanMatchSlam(world.x, world.y, world.theta,
-                                  planner.map, tun)
+                                   planner.map, tun)
         pose_provider = estimator.pose
+        observation_pose_provider = estimator.dead_reckoning_pose
     else:
         raise ValueError("unknown pose_source: " + pose_source)
-    return ReactiveController(tun, planner=planner,
-                              pose_provider=pose_provider,
-                              estimator=estimator)
+    if tun.controller_mode == "path":
+        from path_controller import PathController
+        return PathController(
+            tun, planner=planner, pose_provider=pose_provider,
+            estimator=estimator,
+            observation_pose_provider=observation_pose_provider)
+    if tun.controller_mode != "cell":
+        raise ValueError("unknown controller_mode: " + tun.controller_mode)
+    return ReactiveController(
+        tun, planner=planner, pose_provider=pose_provider,
+        estimator=estimator,
+        observation_pose_provider=observation_pose_provider)
 
 
 def _run_one(seed, cols, rows, mode, pose_source, sim_time_cap_s,
-             collision_budget):
+             collision_budget, cpu_slowdown_factor=1.0):
     """Execute one stress run; return a dict of diagnostics."""
     tun = _load_mode_tunables(mode, 0.18)
+    tun.cpu_slowdown_factor = cpu_slowdown_factor
     maze = Maze(cols, rows, cell_size_m=0.18, seed=seed)
     world = SimWorld(maze, tun)
     sensors = SimSensors(world)
@@ -175,6 +189,27 @@ def _run_one(seed, cols, rows, mode, pose_source, sim_time_cap_s,
     diag["max_idle_window_s"] = idle_window_s[1]
     diag["reverses_per_min"] = (
         controller.recovery_count * 60.0 / world.t) if world.t > 0 else 0.0
+
+    # Path-1 perf snapshot.  Always populated (zeros if controller didn't
+    # tick), so the CSV schema stays stable across --cpu-slowdown-factor
+    # values.
+    perf = controller.perf_summary()
+    if perf:
+        diag["perf_budget_us"] = perf["budget_us"]
+        diag["perf_avg_us"] = perf["avg_us"]
+        diag["perf_max_us"] = perf["max_us"]
+        diag["perf_avg_proj_us"] = perf["avg_proj_us"]
+        diag["perf_max_proj_us"] = perf["max_proj_us"]
+        diag["perf_overruns"] = perf["overrun_count"]
+        diag["perf_overrun_pct"] = perf["overrun_pct"]
+    else:
+        diag["perf_budget_us"] = 0.0
+        diag["perf_avg_us"] = 0.0
+        diag["perf_max_us"] = 0.0
+        diag["perf_avg_proj_us"] = 0.0
+        diag["perf_max_proj_us"] = 0.0
+        diag["perf_overruns"] = 0
+        diag["perf_overrun_pct"] = 0.0
     return diag
 
 
@@ -217,6 +252,14 @@ def main():
     p.add_argument("--collision-budget", type=int, default=30,
                    help="abort run if collisions exceed this")
     p.add_argument("--csv", default="stress_results.csv")
+    p.add_argument("--cpu-slowdown-factor", type=float, default=1.0,
+                   help="multiplier applied to measured controller.step() "
+                        "time to project on-target MCU performance.  Each "
+                        "tick where (measured * factor) > (1e6 / loop_hz) "
+                        "is flagged as an overrun.  1.0 = no emulation "
+                        "(default).  ~150-250 ~ XIAO nRF52840 + "
+                        "CircuitPython.  See ReactiveController."
+                        "perf_summary().")
     args = p.parse_args()
 
     if args.quick:
@@ -245,7 +288,8 @@ def main():
                     n += 1
                     sim_t = args.sim_time + args.sim_time_per_cell_side * (cols + rs)
                     d = _run_one(seed, cols, rs, mode, pose,
-                                 sim_t, args.collision_budget)
+                                 sim_t, args.collision_budget,
+                                 cpu_slowdown_factor=args.cpu_slowdown_factor)
                     d["category"] = _categorise(d)
                     rows.append(d)
                     if n % 10 == 0 or n == total:
@@ -312,6 +356,64 @@ def main():
             r["category"], r["mode"], r["cols"], r["rows"], r["seed"],
             r["pose"], r["distance_m"], r["recoveries"], r["collisions"],
             r["goal_closest_m"], r["max_idle_window_s"]))
+
+    # ---- perf (Path 1: tick-budget projection) ---------------------------
+    # Only meaningful when --cpu-slowdown-factor != 1.0; otherwise the
+    # measured-vs-projected columns are identical and overruns just count
+    # ticks where Mac CPython actually overran the budget (rare).
+    print()
+    print("=== perf (Path 1: tick-budget projection @ {:.1f}x slowdown) ===".format(
+        args.cpu_slowdown_factor))
+    print(("  {:12s} {:12s} {:>9s} {:>9s} {:>10s} {:>10s} {:>7s}").format(
+        "mode", "pose", "budget", "avg_proj", "max_proj", "ticks", "over%"))
+    by_mp = {}
+    for r in rows:
+        key = (r["mode"], r["pose"])
+        d = by_mp.setdefault(key, {
+            "budget_us": r["perf_budget_us"],
+            "ticks": 0, "overruns": 0,
+            "sum_avg_us": 0.0, "sum_avg_proj_us": 0.0,
+            "max_us": 0.0, "max_proj_us": 0.0,
+            "runs": 0,
+        })
+        d["ticks"] += 1
+        d["runs"] += 1
+        d["sum_avg_us"] += r["perf_avg_us"]
+        d["sum_avg_proj_us"] += r["perf_avg_proj_us"]
+        d["overruns"] += r["perf_overruns"]
+        if r["perf_max_us"] > d["max_us"]:
+            d["max_us"] = r["perf_max_us"]
+        if r["perf_max_proj_us"] > d["max_proj_us"]:
+            d["max_proj_us"] = r["perf_max_proj_us"]
+    # Iterate in stable order: cautious, normal, aggressive, race; then
+    # ground_truth, fused, slam.
+    mode_order = ["cautious", "normal", "aggressive", "race"]
+    pose_order = ["ground_truth", "fused", "slam"]
+    total_ticks = 0
+    total_over = 0
+    for m in mode_order:
+        for p in pose_order:
+            if (m, p) not in by_mp:
+                continue
+            d = by_mp[(m, p)]
+            avg_proj_us = d["sum_avg_proj_us"] / d["runs"] if d["runs"] else 0.0
+            # `d["ticks"]` here is per-run records (= total runs for this
+            # mode/pose) -- we want true total ticks for overrun%.  But
+            # we don't have that without summing; approximate by averaging
+            # overrun% per run.  Use perf_overrun_pct directly from rows.
+            ovs = [r["perf_overrun_pct"] for r in rows
+                   if r["mode"] == m and r["pose"] == p]
+            avg_ov = sum(ovs) / len(ovs) if ovs else 0.0
+            print(("  {:12s} {:12s} {:>9.0f} {:>9.0f} {:>10.0f} "
+                   "{:>10d} {:>6.1f}%").format(
+                m, p, d["budget_us"], avg_proj_us, d["max_proj_us"],
+                d["runs"], avg_ov))
+            total_ticks += d["runs"]
+            total_over += d["overruns"]
+    if args.cpu_slowdown_factor == 1.0:
+        print()
+        print("  (note: factor=1.0 -- measured == projected; set "
+              "--cpu-slowdown-factor=200 to emulate XIAO)")
 
 
 if __name__ == "__main__":

@@ -110,6 +110,75 @@ _DEFAULTS = {
     # about untrusted territory; the planner prefers known-open paths even
     # when slightly longer.
     "planner_unknown_cost":       0.5,
+    # When True, the planner may upgrade an L-shaped pair of cardinal
+    # steps into a single 45-deg diagonal cut through the shared corner
+    # (`FloodFillPlanner.desired_motion`).  Saves ~29% of distance per L
+    # and removes one stop-and-pivot.  Default off so cautious / normal
+    # modes stay cardinal-only; enable via race.json or
+    # `--tune planner_use_diagonals=true`.
+    "planner_use_diagonals":      False,
+    # When inside this fraction of a cell of the diagonal target's
+    # center, the controller declares the diagonal done and re-enters
+    # cardinal mode.  Smaller = more accurate but more likely to overshoot
+    # and double back; larger = early-exit at the cost of trajectory
+    # smoothness.  0.35 = 0.063 m for 0.18 m cells -- ~ chassis_radius.
+    "planner_diagonal_arrive_frac": 0.35,
+    # `_corner_passable` strictness.  True (default) requires all four
+    # walls bracketing the diagonal corner to be **known-open**; unknowns
+    # block the cut.  False = Maxim's original optimistic semantics, where
+    # unknowns are treated as open -- only safe when the maze is already
+    # fully mapped (e.g. final race lap after exploration is complete).
+    "planner_diagonal_strict":    True,
+
+    # --- Organic (arc) turning ----------------------------------------------
+    # Forward velocity carried through a planner-driven turn.  0.0 = pure
+    # stop-and-pivot (legacy default).  Above 0, the controller drives
+    # forward at this speed *while* rotating, tracing an arc with radius
+    #     r = arc_turn_v_mps * wheel_base_m / (2 * turn_speed_mps)
+    # For wheelbase=0.085, turn_speed=0.5, arc_turn_v=0.4 -> r = 3.4 cm.
+    # Comfortably fits inside a 0.18 m cell.
+    #
+    # Status (2026-05-23): the feature is implemented end-to-end including
+    # pre-turn deceleration (`_brake_for_next_turn`) so the rate limiter
+    # has time to bring the wheels to arc speed before the cell center.
+    # BUT each arc displaces the robot ~3 cm off the cell center along the
+    # turn diagonal.  Over many turns the drift accumulates and the
+    # robot can wedge.  Default is therefore 0 (stop-and-pivot) until we
+    # add either post-turn wall-centering correction or a path-based
+    # controller.  Opt-in via `--tune arc_turn_v_mps=0.3` for testing.
+    "arc_turn_v_mps":             0.0,
+    # If the heading error to the target exceeds this, the controller
+    # falls back to a pure pivot.  Arc turning a 180-deg about-face would
+    # displace the robot ~2 chassis_radius -- too much.  Cap at ~103-deg.
+    "arc_turn_max_err_rad":       1.8,
+    # Arc angular velocity in rad/s.  When > 0, decouples the arc's
+    # rotation rate from `turn_speed_mps` (which then only governs the
+    # legacy in-place pivot).  Combined with `arc_turn_v_mps` this lets
+    # you choose arc geometry directly:
+    #     radius = arc_turn_v_mps / arc_turn_omega_rps
+    # E.g. (v=0.5, omega=20) -> r=0.025m, duration=pi/40=0.079s,
+    # displacement_perp=0.025m.  Default 0 = use turn_speed_mps
+    # (legacy behaviour: radius = v * wheel_base / (2 * turn_speed)).
+    "arc_turn_omega_rps":         0.0,
+
+    # --- Path-tracking controller ----------------------------------------
+    # Selects the planner-driven control strategy when --planner=flood_fill.
+    # 'cell' = current cell-by-cell controller (default).
+    # 'path' = pure-pursuit path tracker; smoother trajectories, handles
+    # tight race speeds without wedging.
+    "controller_mode":            "cell",
+    # Pure-pursuit lookahead in metres: L = min + gain * v_cur.  Smaller =
+    # tighter tracking but more oscillation; larger = smoother but cuts
+    # corners.  At race tunables (cruise=2 m/s, gain=0.3, min=0.05) the
+    # lookahead is ~0.65 m = 3-4 cells.
+    "path_lookahead_min_m":       0.05,
+    "path_lookahead_gain":        0.30,
+    # Spacing of discrete waypoints along the planned path, in metres.
+    "path_waypoint_spacing_m":    0.02,
+    # Forward-speed cap for the path tracker (m/s).  0.0 = no cap.
+    "path_track_v_max_mps":       0.0,
+    # Off-path distance that triggers recovery and a forced replan.
+    "path_offpath_recover_m":     0.08,
 
     # --- Aggression label (informational; behaviour comes from the
     # numeric tunables above set by a profile).  Echoed into the
@@ -165,6 +234,21 @@ _DEFAULTS = {
     "slam_gate_sigma":            3.0,      # Mahalanobis gate width
     "slam_init_pos_var":          1.0e-4,
     "slam_init_theta_var":        1.0e-6,
+    # Sub-sample the EKF measurement update.  Prediction still runs every
+    # tick (cheap pose integration), but the expensive ray-cast +
+    # Jacobian update only runs every Nth tick.  N=1 = every tick (legacy
+    # default); N=3 cuts SLAM CPU by ~3x with ~15 ms of correction lag at
+    # race speeds -- well within the planner's cell-attribution tolerance.
+    "slam_measurement_period_ticks": 1,
+    # SLAM measurement Jacobian flavour:
+    #   "analytical" -- closed-form partials w.r.t. (x, y, theta) for the
+    #     active wall segment each ray hits.  3 ray-casts per tick total.
+    #     Default.  7-10x faster than central differences.
+    #   "central"    -- legacy 6-perturbation central-difference Jacobian
+    #     (18 ray-casts per tick).  Slower but more robust at ray/wall
+    #     corner transitions.  Use for regression testing or if the
+    #     analytical version has issues on a specific maze geometry.
+    "slam_jacobian_mode":         "analytical",
 
     # --- Software PWM cap (DRV8833 thermal protection, from new spec) ----
     # Maximum duty cycle the inner-loop wheel controller is allowed to
@@ -179,6 +263,33 @@ _DEFAULTS = {
     # radius before the collision check runs -- bring this down for race
     # mode.  Default is safe up to ~3 m/s.
     "sim_max_substep_s":          0.005,
+
+    # --- CPU performance emulation (Path 1 diagnostic) -------------------
+    # The Mac runs the algorithm orders of magnitude faster than the XIAO
+    # nRF52840 Sense (64 MHz Cortex-M4 + CircuitPython interpreter).  We
+    # measure the wall-clock time of controller.step()+_rate_limit() in
+    # sim, then multiply by this factor to project the equivalent on-MCU
+    # time.  Each tick is flagged as "overrun" when projected > budget.
+    # No effect on the simulated physics -- pure diagnostic.
+    #   1.0  = no emulation (default; pure timing without projection)
+    #   ~50  = CPython on a Raspberry Pi class machine
+    #   ~150 = MicroPython on Cortex-M4 @ 64 MHz
+    #   ~250 = CircuitPython on Cortex-M4 @ 64 MHz (conservative)
+    "cpu_slowdown_factor":        1.0,
+    # Tick budget in microseconds.  0 = derived from loop_hz (1e6/loop_hz).
+    # Explicit override is useful for "what if I had X µs to spare per
+    # tick" what-if analysis.
+    "perf_budget_us":             0.0,
+    # Path-2 wall-clock emulation.  When True, after each tick the loop
+    # sleeps for `measured_us * (cpu_slowdown_factor - 1)` microseconds,
+    # forcing the *wall-clock* per-tick time to scale up to the projected
+    # MCU value.  Sim physics still advances by dt = 1/loop_hz, so the
+    # simulated trajectory is unchanged -- but the visualizer renders at
+    # the projected hardware speed, useful for "feel" testing whether the
+    # algorithm copes when each control decision lags real time.  Slows
+    # the run dramatically; use cpu_slowdown_factor=10-50 for casual feel
+    # testing rather than the full 200x.
+    "cpu_wallclock_emulate":      False,
 
     # --- Telemetry -------------------------------------------------------
     "telem_enabled":              True,

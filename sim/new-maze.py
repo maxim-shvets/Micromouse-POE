@@ -41,7 +41,8 @@ _CORNERS = {
 
 class MazeGenerator:
     def __init__(self, cols, rows, cell_size_m=0.18, seed=None,
-                 start_corner='bl', loops=0.15, max_retries=100):
+                 start_corner='bl', loops=0.15, max_retries=100,
+                 diagonal_runs=0, diagonal_min_len=8, diagonal_max_len=14):
         if cols % 2 != 0 or rows % 2 != 0:
             raise ValueError("cols and rows must be even")
         if cols < 4 or rows < 4:
@@ -55,6 +56,13 @@ class MazeGenerator:
         self.seed = seed
         self.start_corner = start_corner
         self.loops = loops
+        # Long-diagonal injection.  When > 0, carve that many staircase
+        # corridors (alternating-turn zigzags) so the maze contains
+        # genuine micromouse-style diagonal runs.  See _inject_diagonal_runs.
+        self.diagonal_runs = diagonal_runs
+        self.diagonal_min_len = diagonal_min_len
+        self.diagonal_max_len = diagonal_max_len
+        self._diagonal_seeds = []   # staircases carved this attempt
 
         # 2x2 goal block: bottom-left cell at (gc, gr)
         self.gc = cols // 2 - 1
@@ -80,8 +88,10 @@ class MazeGenerator:
                 [[True, True, True, True] for _ in range(rows)]
                 for _ in range(cols)
             ]
+            self._diagonal_seeds = []
             self._carve(rng)
             self._add_loops(rng)
+            self._inject_diagonal_runs(rng)
             self._setup_start()
             self.gateway = self._build_goal_island(rng)
             self._enforce_lattice_rule(rng)
@@ -162,6 +172,170 @@ class MazeGenerator:
             nc, nr = c + _DX[d], r + _DY[d]
             self.walls[c][r][d] = False
             self.walls[nc][nr][_OPP[d]] = False
+
+    # ------------------------------------------------------------------
+    # Long diagonal runs (micromouse-style staircase corridors)
+    # ------------------------------------------------------------------
+
+    def _inject_diagonal_runs(self, rng):
+        """Carve `self.diagonal_runs` staircase corridors into the maze.
+
+        A staircase is an alternating two-cardinal zigzag (e.g. E, N, E,
+        N, ...) whose net travel is a 45-degree diagonal.  Carving the
+        zigzag open creates a thin corridor whose shared-edge midpoints
+        lie on a single straight 45-degree line -- the trajectory a
+        micromouse drives when "going diagonal".  Detected afterwards by
+        `find_diagonal_runs`.
+
+        The corridor is left THIN (we do not open the 2x2 blocks), so the
+        interior posts keep their walls and the lattice rule stays
+        satisfiable.  The mouse clears those posts by weaving along the
+        edge-midpoint line, half a cell off the cell centers.
+        """
+        if self.diagonal_runs <= 0:
+            return
+        # (d1, d2) alternating-cardinal pairs -> net diagonal direction.
+        diag_pairs = [
+            (1, 0),   # E, N -> NE
+            (1, 2),   # E, S -> SE
+            (3, 0),   # W, N -> NW
+            (3, 2),   # W, S -> SW
+        ]
+        placed = 0
+        attempts = 0
+        budget = max(40, self.diagonal_runs * 40)
+        while placed < self.diagonal_runs and attempts < budget:
+            attempts += 1
+            length = rng.randint(self.diagonal_min_len, self.diagonal_max_len)
+            d1, d2 = rng.choice(diag_pairs)
+            start_with = rng.choice((d1, d2))
+            c = rng.randrange(self.cols)
+            r = rng.randrange(self.rows)
+            if self._carve_staircase(c, r, d1, d2, start_with, length):
+                placed += 1
+
+    def _carve_staircase(self, c, r, d1, d2, first, length):
+        """Try to carve a `length`-step alternating staircase from (c, r).
+
+        Alternates `first` then the other of {d1, d2}.  Aborts (carving
+        nothing) if the path would leave the grid or touch the start /
+        goal cells.  Returns True iff the staircase was carved.
+        """
+        cells = [(c, r)]
+        moves = []
+        cur_c, cur_r = c, r
+        d = first
+        other = d2 if first == d1 else d1
+        for _ in range(length):
+            if (cur_c, cur_r) in self.goal_cells or (cur_c, cur_r) == self.start_cell:
+                return False
+            nc, nr = cur_c + _DX[d], cur_r + _DY[d]
+            if not (0 <= nc < self.cols and 0 <= nr < self.rows):
+                return False
+            if (nc, nr) in self.goal_cells or (nc, nr) == self.start_cell:
+                return False
+            moves.append((cur_c, cur_r, d))
+            cells.append((nc, nr))
+            cur_c, cur_r = nc, nr
+            d = other if d == first else first
+        for mc, mr, md in moves:
+            self.walls[mc][mr][md] = False
+            nc, nr = mc + _DX[md], mr + _DY[md]
+            self.walls[nc][nr][_OPP[md]] = False
+        self._diagonal_seeds.append(list(cells))
+        return True
+
+    def _diagonal_routes(self, c, r, dcx, dcy):
+        """Return (route_a_open, route_b_open) for a diagonal move
+        (c,r) -> (c+dcx, r+dcy).
+
+        route_a = horizontal-first L (via the cell east/west of (c,r)),
+        route_b = vertical-first L (via the cell north/south of (c,r)).
+        Out-of-bounds target -> (False, False).
+        """
+        nc, nr = c + dcx, r + dcy
+        if not (0 <= nc < self.cols and 0 <= nr < self.rows):
+            return (False, False)
+        d_h = 1 if dcx > 0 else 3   # E or W
+        d_v = 0 if dcy > 0 else 2   # N or S
+        bx, by = c + dcx, r
+        route_a = (not self.walls[c][r][d_h]) and (not self.walls[bx][by][d_v])
+        ax, ay = c, r + dcy
+        route_b = (not self.walls[c][r][d_v]) and (not self.walls[ax][ay][d_h])
+        return (route_a, route_b)
+
+    def _diagonal_step_ok(self, c, r, dcx, dcy, thin_only=True):
+        """Whether a diagonal move (c,r) -> (c+dcx, r+dcy) counts.
+
+        `thin_only=True` (default): exactly ONE L-route open -- a forced
+        staircase corridor, the genuine micromouse diagonal.  Excludes
+        wide-open 2x2 areas (both routes open), which aren't distinctive
+        diagonals.
+
+        `thin_only=False`: at least one L-route open -- "can the mouse cut
+        this corner at all" (used by the planner's cut logic).
+        """
+        ra, rb = self._diagonal_routes(c, r, dcx, dcy)
+        if thin_only:
+            return ra != rb       # exactly one -> thin corridor
+        return ra or rb
+
+    def find_diagonal_runs(self, min_cells=3, thin_only=True):
+        """Find maximal straight diagonal runs of >= `min_cells` cells.
+
+        Returns a list of dicts: {'cells': [(c,r), ...], 'dir': (dcx, dcy)}.
+        Only the two dcx>0 families (NE, SE) are scanned, so each straight
+        diagonal is reported once (a NE run and its SW reverse are the
+        same physical line).
+
+        `thin_only=True` reports only forced staircase corridors (the
+        prominent micromouse diagonals); False also reports diagonals
+        through open areas.
+        """
+        runs = []
+        for dcx, dcy in ((1, 1), (1, -1)):
+            for c in range(self.cols):
+                for r in range(self.rows):
+                    pc, pr = c - dcx, r - dcy
+                    prev_ok = (0 <= pc < self.cols and 0 <= pr < self.rows
+                               and self._diagonal_step_ok(pc, pr, dcx, dcy,
+                                                          thin_only))
+                    if prev_ok:
+                        continue
+                    run = [(c, r)]
+                    cc, cr = c, r
+                    while self._diagonal_step_ok(cc, cr, dcx, dcy, thin_only):
+                        cc, cr = cc + dcx, cr + dcy
+                        run.append((cc, cr))
+                    if len(run) >= min_cells:
+                        runs.append({'cells': run, 'dir': (dcx, dcy)})
+        return runs
+
+    def diagonal_trajectory_cells(self, run):
+        """Edge-midpoint polyline (in cell units) for a diagonal run.
+
+        For a straight diagonal run the staircase's shared-edge midpoints
+        are colinear at 45 deg -- this returns them as the drivable
+        weaving line (offset half a cell from the cell centers, so it
+        clears the interior posts).
+        """
+        cells = run['cells']
+        pts = []
+        # Enter from the first cell's center.
+        c0, r0 = cells[0]
+        pts.append((c0 + 0.5, r0 + 0.5))
+        for i in range(len(cells) - 1):
+            (ca, ra), (cb, rb) = cells[i], cells[i + 1]
+            # Midpoint of the two diagonal-neighbour cell centers == the
+            # shared post; nudge to the open side's edge midpoint.
+            # Edge-midpoint = average of the two centers (lies on the
+            # weaving line by construction for a thin staircase).
+            mx = (ca + 0.5 + cb + 0.5) / 2.0
+            my = (ra + 0.5 + rb + 0.5) / 2.0
+            pts.append((mx, my))
+        cn, rn = cells[-1]
+        pts.append((cn + 0.5, rn + 0.5))
+        return pts
 
     def _setup_start(self):
         """Enforce 3-wall enclosure at start corner and open exit direction."""
@@ -413,8 +587,12 @@ class MazeGenerator:
         lines.append(bot)
         return '\n'.join(lines)
 
-    def render_matplotlib(self):
-        """Display maze in a matplotlib window."""
+    def render_matplotlib(self, diagonal_runs=None):
+        """Display maze in a matplotlib window.
+
+        If `diagonal_runs` is provided (from `find_diagonal_runs`), draws
+        the weaving 45-degree trajectory of each run as a coloured line.
+        """
         import matplotlib.pyplot as plt
         import matplotlib.patches as patches
 
@@ -464,9 +642,27 @@ class MazeGenerator:
                 ha='center', va='center', fontsize=11, fontweight='bold',
                 color='darkred', zorder=5)
 
+        # Diagonal run overlay -- weaving 45-degree trajectories.
+        if diagonal_runs:
+            labelled = False
+            for run in diagonal_runs:
+                pts = self.diagonal_trajectory_cells(run)
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                ax.plot(xs, ys, color='royalblue', lw=2.5, alpha=0.8,
+                        zorder=6, solid_capstyle='round',
+                        label='Diagonal run' if not labelled else None)
+                # Mark the run's cell centers.
+                for (cc, cr) in run['cells']:
+                    ax.add_patch(patches.Rectangle(
+                        (cc, cr), 1, 1, facecolor='royalblue',
+                        alpha=0.12, zorder=1))
+                labelled = True
+
         ax.set_title(
             f'Micromouse Maze  {self.cols}×{self.rows}  '
-            f'seed={self.seed}  corner={self.start_corner}  loops={self.loops}')
+            f'seed={self.seed}  corner={self.start_corner}  loops={self.loops}  '
+            f'diagonals={len(diagonal_runs) if diagonal_runs else 0}')
         ax.legend(loc='upper right', fontsize=9)
         plt.tight_layout()
         plt.show()
@@ -490,6 +686,18 @@ def main():
                         help='Start corner (bl/br/tl/tr, default bl)')
     parser.add_argument('--loops', type=float, default=0.15,
                         help='Fraction of extra walls to remove (default 0.15)')
+    parser.add_argument('--diagonal-runs', type=int, default=0,
+                        help='Inject N long staircase corridors that create '
+                             'micromouse-style diagonal runs (default 0)')
+    parser.add_argument('--diagonal-min-len', type=int, default=8,
+                        help='Min staircase length in steps; a length-N '
+                             'staircase yields ~N/2+1 diagonal cells '
+                             '(default 8)')
+    parser.add_argument('--diagonal-max-len', type=int, default=14,
+                        help='Max staircase length in steps (default 14)')
+    parser.add_argument('--diagonal-show', type=int, default=8,
+                        help='How many of the longest diagonal runs to draw '
+                             '(default 8; keeps the overlay readable)')
     parser.add_argument('--no-display', action='store_true',
                         help='Skip matplotlib window')
     args = parser.parse_args()
@@ -510,6 +718,9 @@ def main():
         seed=args.seed,
         start_corner=args.start_corner,
         loops=args.loops,
+        diagonal_runs=args.diagonal_runs,
+        diagonal_min_len=args.diagonal_min_len,
+        diagonal_max_len=args.diagonal_max_len,
     )
 
     print(maze.render_ascii())
@@ -523,8 +734,20 @@ def main():
     print(f'Wall components: {components}  (2 = outer boundary + goal island)')
     print('Anti-wall-hug  : VERIFIED — left/right-hand followers cannot reach goal')
 
+    all_runs = maze.find_diagonal_runs(min_cells=3, thin_only=True)
+    all_runs.sort(key=lambda x: -len(x['cells']))
+    long_runs = [r for r in all_runs if len(r['cells']) >= 4]
+    short_count = len(all_runs) - len(long_runs)
+    print(f'Diagonal runs  : {len(long_runs)} long (>= 4 cells), '
+          f'{short_count} short (3 cells)  requested={args.diagonal_runs}')
+    _dname = {(1, 1): 'NE', (1, -1): 'SE'}
+    for run in long_runs[:args.diagonal_show]:
+        dcx, dcy = run['dir']
+        print(f'  {len(run["cells"]):2d} cells {_dname[(dcx, dcy)]}  '
+              f'{run["cells"][0]} -> {run["cells"][-1]}')
+
     if not args.no_display:
-        maze.render_matplotlib()
+        maze.render_matplotlib(diagonal_runs=long_runs[:args.diagonal_show])
 
 
 if __name__ == '__main__':

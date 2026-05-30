@@ -126,6 +126,10 @@ def _parse_args(argv):
                         "requires even cols/rows >= 4); "
                         "'sim' = original recursive backtracker (sim/maze.py, "
                         "any size in [3,20]). Default: new")
+    p.add_argument("--diagonal-runs", type=int, default=0,
+                   help="inject N long staircase corridors into the maze "
+                        "(micromouse-style diagonal runs).  Only applies to "
+                        "--maze-algo new.  Default 0.")
     p.add_argument("--planner", choices=("none", "flood_fill"), default="none",
                    help="enable the flood-fill planner above the reactive "
                         "controller (default: none -- legacy reactive-only)")
@@ -275,6 +279,7 @@ def _build_maze(args):
         rows=args.rows,
         cell_size_m=args.cell_size,
         seed=args.seed,
+        diagonal_runs=args.diagonal_runs,
     )
 
 

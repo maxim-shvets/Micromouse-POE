@@ -667,6 +667,122 @@ class FloodFillPlanner(object):
         self.diagonals_offered += 1
         return ('diagonal', target_theta, target_cell)
 
+    # ---- long diagonal runs (thin micromouse diagonals) -------------------
+
+    def _diag_route_cell(self, c, r, d1, d2):
+        """Intermediate orthogonal cell for a diagonal step (c,r) via
+        cardinals d1-then-d2, or None if neither L-route is known-open.
+
+        Unlike `_corner_passable` (which wants BOTH routes open for a
+        center-to-center cut), this needs only ONE route open -- the true
+        micromouse rule -- and returns the cell the mouse rounds.  Only
+        known-open (`is False`) walls count, so the run is safe on a
+        mapped maze.
+        """
+        walls = self.map.walls
+        cols, rows = self.cols, self.rows
+        bc, br = c + _DC[d1], r + _DR[d1]
+        if (0 <= bc < cols and 0 <= br < rows
+                and walls[c][r][d1] is False and walls[bc][br][d2] is False):
+            return (bc, br)
+        ac, ar = c + _DC[d2], r + _DR[d2]
+        if (0 <= ac < cols and 0 <= ar < rows
+                and walls[c][r][d2] is False and walls[ac][ar][d1] is False):
+            return (ac, ar)
+        return None
+
+    def diagonal_run(self, cell, current_heading, max_cells=16):
+        """Detect a long straight diagonal run starting at `cell`.
+
+        Follows the optimal cardinal path; while it keeps zig-zagging in a
+        single 45-degree direction (alternating the same two cardinals)
+        with each corner traversable, the cells are collected into a run.
+
+        Returns None if the run is shorter than 3 diagonal cells (i.e. not
+        a *long* diagonal -- single corners are handled by
+        `desired_motion`).  Otherwise returns a dict:
+
+            cells       : [P0, P1, ...]   diagonal-neighbour cells
+            orth_cells  : [P0, mid0, P1, mid1, ...]  orthogonal staircase
+            waypoints   : [(x, y), ...]   world-frame weaving polyline.
+                          The interior points are the staircase's shared-
+                          face midpoints -- colinear at 45 deg, offset
+                          half a cell from the post line so the mouse
+                          clears the interior posts.
+            exit_cell   : last cell of the run
+            exit_heading: cardinal to resume with after the run
+            theta       : the run's 45-degree heading (radians)
+
+        Only active when `self.use_diagonals` is set.
+        """
+        if not self.use_diagonals:
+            return None
+        if self._dirty or self._dist is None:
+            self.replan()
+
+        c, r = cell
+        d1 = self.desired_heading((c, r), current_heading)
+        nc, nr = c + _DC[d1], r + _DR[d1]
+        if not (0 <= nc < self.cols and 0 <= nr < self.rows):
+            return None
+        d2 = self.desired_heading((nc, nr), d1)
+        if d2 == d1 or (d1 + 2) % 4 == d2 or (d1, d2) not in _DIAG_ANGLE:
+            return None
+
+        net = (_DC[d1] + _DC[d2], _DR[d1] + _DR[d2])   # diagonal step vector
+        theta = _DIAG_ANGLE[(d1, d2)]
+
+        cells = [(c, r)]
+        orth = [(c, r)]
+        cur = (c, r)
+        heading = current_heading
+        for _ in range(max_cells):
+            a = self.desired_heading(cur, heading)
+            mid = self._diag_route_cell(cur[0], cur[1], d1, d2)
+            nxt = (cur[0] + net[0], cur[1] + net[1])
+            if not (0 <= nxt[0] < self.cols and 0 <= nxt[1] < self.rows):
+                break
+            if mid is None:
+                break
+            # Confirm the optimal path actually heads into this diagonal
+            # step (its first cardinal is one of d1/d2 toward `net`).
+            if a != d1 and a != d2:
+                break
+            orth.append(mid)
+            orth.append(nxt)
+            cells.append(nxt)
+            cur = nxt
+            heading = d2 if a == d1 else d1
+            if cur == self.goal_cell:
+                break
+
+        if len(cells) < 3:
+            return None
+
+        s = self.cell_size_m
+        def ctr(cell_):
+            return ((cell_[0] + 0.5) * s, (cell_[1] + 0.5) * s)
+
+        waypoints = [ctr(orth[0])]
+        for i in range(len(orth) - 1):
+            (ca, ra), (cb, rb) = orth[i], orth[i + 1]
+            waypoints.append(((ca + cb + 1.0) * 0.5 * s,
+                              (ra + rb + 1.0) * 0.5 * s))
+        waypoints.append(ctr(orth[-1]))
+
+        # Resume heading after the run = the optimal cardinal out of the
+        # exit cell.
+        exit_heading = self.desired_heading(cur, heading)
+        self.diagonals_offered += 1
+        return {
+            'cells': cells,
+            'orth_cells': orth,
+            'waypoints': waypoints,
+            'exit_cell': cur,
+            'exit_heading': exit_heading,
+            'theta': theta,
+        }
+
 
 # -----------------------------------------------------------------------------
 # Pose helpers

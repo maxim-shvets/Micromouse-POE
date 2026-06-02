@@ -12,22 +12,40 @@ validated against:
 Run it ONLY after the bring-up tests in hardware/tests/ all pass
 (I2C scan, ToF, IMU, motors, encoders, polarity).
 
+START / CONTROL OVER BLUETOOTH (no physical button needed):
+    The XIAO's BLE radio advertises as "Micromouse".  Drive it from EITHER:
+      - a laptop:  python3 tools/mouse_console.py   (needs `pip install
+        bleak`; no phone app -- recommended for dev / tuning / logging), OR
+      - a phone:   any BLE UART app (Bluefruit Connect -> UART, etc.)
+    Send newline-terminated commands:
+        go        run the full flow (explore -> return -> speed)
+        explore / return / speed   run one phase
+        stop      EMERGENCY STOP (abort, motors off)
+        reset     forget the mapped maze
+        status    report current cell
+    Status is sent back so the controller shows progress.  See
+    ble_control.py (robot side) + tools/mouse_console.py (laptop side).
+    If the adafruit_ble library is absent, it falls back to a timed
+    countdown start and runs the full flow once.
+
 Board filesystem layout expected (copy these to CIRCUITPY root):
     code.py                       <- this file
     interfaces.py algorithm.py planner.py pose_fusion.py slam.py
     tunables.py                   <- the CircuitPython-portable core
     hardware/__init__.py
     hardware/xiao_nrf52840.py     <- the adapter (drivers + pin map)
-    lib/  adafruit_tca9548a  adafruit_vl53l0x  adafruit_lsm6ds
+    hardware/ble_control.py       <- BLE UART control
+    lib/  adafruit_tca9548a  adafruit_vl53l0x  adafruit_lsm6ds  adafruit_ble
     tunables.json                 <- optional saved profile (else defaults)
 
 Status LED (on-board RGB, active-low):
-    blue  blinking   waiting to start (countdown)
+    blue  blinking   advertising, waiting for a BLE connection
+    blue  solid      phone connected, waiting for a command
     green solid      EXPLORE in progress
     yellow solid     RETURN in progress
-    cyan  blinking   SPEED run in progress
-    green slow blink  DONE
-    red   blinking   error / phase timed out (motors stopped)
+    cyan  solid      SPEED run in progress
+    green slow blink  DONE (back to ready)
+    red   blinking   error / phase aborted (motors stopped)
 
 SAFETY: the motors WILL drive.  On the bench, prop the robot up.  A
 phase aborts (motors stop, red LED) if it can't reach its target within
@@ -40,6 +58,7 @@ import time
 
 from hardware.xiao_nrf52840 import (
     TcaVL53L0X, XiaoIMU, DriverN20, MonotonicClock)
+from hardware.ble_control import BleControl
 from planner import FloodFillPlanner
 from slam import ScanMatchSlam
 from algorithm import ReactiveController
@@ -180,8 +199,14 @@ def make_controller(planner, estimator, tun):
 # -----------------------------------------------------------------------------
 
 def run_phase(name, target_cells, controller, planner, estimator,
-              sensors, drive, imu, clock, tun, max_time_s, led, led_rgb):
+              sensors, drive, imu, clock, tun, max_time_s, led, led_rgb, ble):
+    """Drive until the estimated cell reaches `target_cells`.
+
+    Returns one of: "reached", "timeout", "stuck", "stopped".  A BLE
+    "stop" command aborts immediately ("stopped").
+    """
     print("PHASE {}: target {} ...".format(name, sorted(target_cells)))
+    ble.send(name + " ...")
     dt = 1.0 / tun.loop_hz
     t0 = clock.now()
     dwell = 0
@@ -207,14 +232,25 @@ def run_phase(name, target_cells, controller, planner, estimator,
         x, y, _th = estimator.pose()
         cell = planner.pose_to_cell(x, y)
 
+        # BLE control: emergency stop / status while running.
+        for c in ble.poll():
+            if c in ("stop", "x", "halt"):
+                drive.stop()
+                print("  STOP (ble)")
+                ble.send("STOPPED in " + name)
+                return "stopped"
+            if c in ("status", "?"):
+                ble.send("{} at {}".format(name, cell))
+
         # Reached?
         if cell in target_cells:
             dwell += 1
             if dwell >= REACH_DWELL_TICKS:
                 drive.stop()
-                print("  reached {} at t={:.1f}s".format(
-                    cell, clock.now() - t0))
-                return True
+                t = clock.now() - t0
+                print("  reached {} at t={:.1f}s".format(cell, t))
+                ble.send("reached {} t={:.1f}s".format(cell, t))
+                return "reached"
         else:
             dwell = 0
 
@@ -229,7 +265,8 @@ def run_phase(name, target_cells, controller, planner, estimator,
         if now - t0 > max_time_s:
             drive.stop()
             print("  TIMEOUT after {:.0f}s".format(max_time_s))
-            return False
+            ble.send("TIMEOUT " + name)
+            return "timeout"
         # No-progress watchdog.
         if now - wd_t >= WATCHDOG_WINDOW_S:
             moved = ((x - wd_ref[0]) ** 2 + (y - wd_ref[1]) ** 2) ** 0.5
@@ -237,7 +274,8 @@ def run_phase(name, target_cells, controller, planner, estimator,
                 drive.stop()
                 print("  STUCK (moved {:.3f} m in {:.0f}s)".format(
                     moved, WATCHDOG_WINDOW_S))
-                return False
+                ble.send("STUCK " + name)
+                return "stuck"
             wd_t = now
             wd_ref = (x, y)
 
@@ -248,8 +286,16 @@ def run_phase(name, target_cells, controller, planner, estimator,
 # Main competition flow
 # -----------------------------------------------------------------------------
 
+_PHASE_RGB = {
+    "EXPLORE": (False, True, False),    # green
+    "RETURN": (True, True, False),      # yellow
+    "SPEED": (False, True, True),       # cyan
+}
+
+
 def main():
     led = StatusLed()
+    ble = BleControl()
 
     # --- Load tunables ---------------------------------------------------
     try:
@@ -266,81 +312,153 @@ def main():
     s = base_tun.planner_cell_size_m
     sx = (START_CELL[0] + 0.5) * s
     sy = (START_CELL[1] + 0.5) * s
-
-    # One SLAM estimator + one KnownMap shared across every phase.
-    explore_planner = make_planner(_goal_cell(), None, base_tun)
-    shared_map = explore_planner.map
-    estimator = ScanMatchSlam(sx, sy, START_THETA, shared_map, base_tun)
-
     center = _center_cells()
     start_set = frozenset([START_CELL])
 
-    # --- Start countdown -------------------------------------------------
-    print("Place the robot at the start.  Starting in {:.0f}s ...".format(
-        START_COUNTDOWN_S))
-    t_end = clock.now() + START_COUNTDOWN_S
-    while clock.now() < t_end:
-        on = int(clock.now() * 2) % 2 == 0
-        led.set(False, False, on)   # blue blink
-        clock.sleep(0.1)
+    # One KnownMap + one SLAM estimator, persisted across commands so the
+    # learned maze carries between explore / return / speed.  Held in a
+    # dict so the nested helpers can rebuild them ("reset").
+    base_planner = make_planner(_goal_cell(), None, base_tun)
+    st = {"map": base_planner.map,
+          "est": ScanMatchSlam(sx, sy, START_THETA, base_planner.map, base_tun)}
 
-    ok = True
-    try:
-        # --- EXPLORE -----------------------------------------------------
+    def reset_pose():
+        st["est"] = ScanMatchSlam(sx, sy, START_THETA, st["map"], base_tun)
+
+    def reset_map():
+        np_ = make_planner(_goal_cell(), None, base_tun)
+        st["map"] = np_.map
+        reset_pose()
+
+    def speed_tun():
+        return Tunables.from_overrides(
+            ["{}={}".format(k, v) for k, v in SPEED_OVERRIDES.items()],
+            base=base_tun)
+
+    def run_one(name, goal, target, tun, max_t):
+        planner = make_planner(goal, st["map"], tun)
+        ctrl = make_controller(planner, st["est"], tun)
+        rgb = _PHASE_RGB.get(name, (False, True, False))
+        led.set(rgb[0], rgb[1], rgb[2])
+        return run_phase(name, target, ctrl, planner, st["est"],
+                         sensors, drive, imu, clock, tun, max_t, led, rgb, ble)
+
+    def do_full():
+        # Fresh pose origin each full run (robot is placed at start).
+        reset_pose()
         if DO_EXPLORE:
-            led.set(False, True, False)   # green
-            ctrl = make_controller(explore_planner, estimator, base_tun)
-            ok = run_phase("EXPLORE", center, ctrl, explore_planner,
-                           estimator, sensors, drive, imu, clock, base_tun,
-                           EXPLORE_TIME_S, led, (False, True, False))
-            if not ok:
-                raise RuntimeError("explore failed")
+            if run_one("EXPLORE", _goal_cell(), center, base_tun,
+                       EXPLORE_TIME_S) != "reached":
+                return False
+        if DO_RETURN:
+            if run_one("RETURN", START_CELL, start_set, base_tun,
+                       RETURN_TIME_S) != "reached":
+                return False
+        if DO_SPEED:
+            if run_one("SPEED", _goal_cell(), center, speed_tun(),
+                       SPEED_TIME_S) != "reached":
+                return False
+        return True
 
-        # --- RETURN ------------------------------------------------------
-        if ok and DO_RETURN:
-            led.set(True, True, False)    # yellow
-            ret_planner = make_planner(START_CELL, shared_map, base_tun)
-            ctrl = make_controller(ret_planner, estimator, base_tun)
-            ok = run_phase("RETURN", start_set, ctrl, ret_planner,
-                           estimator, sensors, drive, imu, clock, base_tun,
-                           RETURN_TIME_S, led, (True, True, False))
-            if not ok:
-                raise RuntimeError("return failed")
+    def done_blink():
+        # green slow blink until the next command (BLE) / forever (no BLE).
+        for _ in range(8):
+            led.set(False, True, False)
+            clock.sleep(0.2)
+            led.set(False, False, False)
+            clock.sleep(0.2)
+            if ble.connected and ble.poll():
+                return
 
-        # --- SPEED -------------------------------------------------------
-        if ok and DO_SPEED:
-            led.set(False, True, True)    # cyan
-            speed_tun = Tunables.from_overrides(
-                ["{}={}".format(k, v) for k, v in SPEED_OVERRIDES.items()],
-                base=base_tun)
-            speed_planner = make_planner(_goal_cell(), shared_map, speed_tun)
-            ctrl = make_controller(speed_planner, estimator, speed_tun)
-            ok = run_phase("SPEED", center, ctrl, speed_planner,
-                           estimator, sensors, drive, imu, clock, speed_tun,
-                           SPEED_TIME_S, led, (False, True, True))
-
-        # --- Done --------------------------------------------------------
-        drive.stop()
-        if ok:
-            print("RUN COMPLETE.")
-            while True:
-                on = int(clock.now()) % 2 == 0
-                led.set(False, on, False)   # green slow blink
-                clock.sleep(0.25)
-        else:
-            raise RuntimeError("speed run failed")
-
-    except Exception as e:  # noqa: BLE001
-        # Any failure -> motors off, red blink, surface the message.
+    # --- No BLE library -> legacy countdown + a single full run ----------
+    if not ble.available:
+        print("BLE unavailable -> countdown start.")
+        t_end = clock.now() + START_COUNTDOWN_S
+        while clock.now() < t_end:
+            on = int(clock.now() * 2) % 2 == 0
+            led.set(False, False, on)       # blue blink
+            clock.sleep(0.1)
         try:
+            ok = do_full()
             drive.stop()
-        except Exception:  # noqa: BLE001
-            pass
-        print("ABORT:", e)
+            print("RUN COMPLETE." if ok else "RUN ENDED (phase failed).")
+        except Exception as e:  # noqa: BLE001
+            try:
+                drive.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            print("ABORT:", e)
         while True:
-            on = int(clock.now() * 3) % 2 == 0
-            led.set(on, False, False)       # red blink
-            clock.sleep(0.15)
+            led.set(False, True, False)
+            clock.sleep(0.5)
+
+    # --- BLE command loop ------------------------------------------------
+    print("BLE ready. Advertising as 'Micromouse'. Send: "
+          "go explore return speed stop reset status")
+    was_connected = False
+    while True:
+        ble.service()
+        now_connected = ble.connected
+        if now_connected and not was_connected:
+            ble.send("Micromouse READY")
+            ble.send("cmds: go explore return speed stop reset status")
+        was_connected = now_connected
+
+        # Ready indicator: blue solid when a phone is connected, slow blue
+        # blink while still advertising / waiting.
+        if now_connected:
+            led.set(False, False, True)
+        else:
+            led.set(False, False, int(clock.now() * 2) % 2 == 0)
+
+        for c in ble.poll():
+            try:
+                if c in ("go", "run", "start"):
+                    ble.send("GO")
+                    ok = do_full()
+                    drive.stop()
+                    ble.send("DONE" if ok else "ENDED")
+                elif c == "explore":
+                    reset_pose()
+                    run_one("EXPLORE", _goal_cell(), center, base_tun,
+                            EXPLORE_TIME_S)
+                    drive.stop()
+                elif c == "return":
+                    run_one("RETURN", START_CELL, start_set, base_tun,
+                            RETURN_TIME_S)
+                    drive.stop()
+                elif c == "speed":
+                    run_one("SPEED", _goal_cell(), center, speed_tun(),
+                            SPEED_TIME_S)
+                    drive.stop()
+                elif c == "reset":
+                    reset_map()
+                    ble.send("map cleared")
+                elif c in ("status", "?"):
+                    x, y, _t = st["est"].pose()
+                    cc = max(0, min(COLS - 1, int(x / s)))
+                    rr = max(0, min(ROWS - 1, int(y / s)))
+                    ble.send("READY cell ({}, {})".format(cc, rr))
+                elif c in ("stop", "x", "halt"):
+                    drive.stop()
+                    ble.send("idle")
+                else:
+                    ble.send("? unknown: " + c)
+            except Exception as e:  # noqa: BLE001
+                try:
+                    drive.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                ble.send("ABORT " + str(e))
+                print("ABORT:", e)
+                # flash red briefly, then return to ready.
+                for _ in range(6):
+                    led.set(True, False, False)
+                    clock.sleep(0.1)
+                    led.set(False, False, False)
+                    clock.sleep(0.1)
+
+        clock.sleep(0.05)
 
 
 main()

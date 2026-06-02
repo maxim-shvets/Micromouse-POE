@@ -66,15 +66,22 @@ CircuitPython libraries needed in `CIRCUITPY/lib/`:
 
 ## After bring-up
 
-Once 00–07 all pass, copy the real adapter + algorithm to the board:
+Once 00–07 all pass, flash the **final run script** `hardware/code.py`
+(competition flow: explore → return → speed) to the board:
 
 ```
-# on CIRCUITPY:
-#   code.py  ->  from hardware.xiao_nrf52840 import main; main()
-#   plus: algorithm.py planner.py slam.py pose_fusion.py tunables.py
-#         interfaces.py  (the CircuitPython-portable core)
-#   optionally /tunables.json  (a saved profile)
+# on CIRCUITPY root:
+#   code.py                       <- copy of hardware/code.py
+#   interfaces.py algorithm.py planner.py pose_fusion.py slam.py tunables.py
+#   hardware/__init__.py  hardware/xiao_nrf52840.py
+#   lib/  adafruit_tca9548a  adafruit_vl53l0x  adafruit_lsm6ds
+#   tunables.json                 <- optional saved profile (else defaults)
 ```
+
+`code.py` shows status on the on-board RGB LED (blue=waiting, green=explore,
+yellow=return, cyan=speed, red=aborted) and stops the motors on completion
+or timeout. Edit the CONFIG block at the top to set maze size, which phases
+to run, time budgets, and the speed-phase tunables.
 
 Calibration values you collected here that feed the algorithm:
 - `ENC_COUNTS_PER_REV` (from test 04) → `hardware/xiao_nrf52840.py`

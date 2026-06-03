@@ -381,7 +381,8 @@ class FloodFillPlanner(object):
     def __init__(self, cols, rows, goal_cell, cell_size_m,
                  sensor_forward_offset_m=0.03, wall_tolerance_m=0.05,
                  turn_cost=1.0, reverse_cost=4.0, unknown_cost=0.5,
-                 use_diagonals=False, diagonal_strict=True):
+                 use_diagonals=False, diagonal_strict=True,
+                 existing_map=None):
         self.cols = cols
         self.rows = rows
         self.goal_cell = (int(goal_cell[0]), int(goal_cell[1]))
@@ -403,7 +404,7 @@ class FloodFillPlanner(object):
         # Maxim's original optimistic semantics (unknowns = open) -- only
         # safe after exploration is complete.
         self.diagonal_strict = bool(diagonal_strict)
-        self.map = KnownMap(cols, rows)
+        self.map = KnownMap(cols, rows) if existing_map is None else existing_map
         # Expected side-ray distance when a side wall is present (and no
         # forward wall blocks the ray).  Position-independent because the
         # ray hits a wall line whose perpendicular offset is s/2.

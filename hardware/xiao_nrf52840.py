@@ -35,29 +35,42 @@ level, so this file is syntactically valid on CPython for unit / lint.
 # Pin map -- EDIT to match your wiring.
 # -----------------------------------------------------------------------------
 
-# External I2C bus (exposed at D4=SDA / D5=SCL on XIAO Sense).  Drives the
-# TCA9548A multiplexer, which fans out to the three VL53L0X.
+# External I2C bus (D4=SDA / D5=SCL on XIAO Sense).  Shared by all three
+# VL53L0X ToF sensors via TCA9548A multiplexer.
 PIN_I2C_SDA = "D4"
 PIN_I2C_SCL = "D5"
+
+# VL53L0X XSHUT pins -- pulled low to reset/disable individual sensors
+# during I2C address assignment at startup.
+PIN_TOF_XSHUT_RIGHT  = "D2"
+PIN_TOF_XSHUT_MIDDLE = "D3"
+PIN_TOF_XSHUT_LEFT   = "D6"
 
 # Motor driver pins -- DRV8833 IN1/IN2/IN3/IN4.  Each motor uses a pair:
 # one pin holds at 0 while the other PWMs to drive forward, swap for
 # reverse.  The XIAO has hardware PWM on most pins.
-PIN_M1A = "D0"   # left motor IN1 (AIN1 on DRV8833)
-PIN_M1B = "D1"   # left motor IN2 (AIN2)
-PIN_M2A = "D2"   # right motor IN1 (BIN1)
-PIN_M2B = "D3"   # right motor IN2 (BIN2)
+PIN_M1A = "D10"  # left motor  IN1 (AIN1 on DRV8833)
+PIN_M1B = "D9"   # left motor  IN2 (AIN2)
+PIN_M2A = "D8"   # right motor IN3 (BIN1)
+PIN_M2B = "D7"   # right motor IN4 (BIN2)
+
+# Set to True to flip a motor's forward direction without rewiring.
+# If the robot spins in place instead of going straight, flip one of these.
+MOTOR_LEFT_INVERT  = False
+MOTOR_RIGHT_INVERT = True
 
 # Encoder inputs.  Use single-channel hall + sign-from-command for v1
 # (quadrature support would need two countio.Counter per wheel and a
 # direction-inference state machine).
-PIN_ENC_LA = "D6"
-PIN_ENC_RA = "D7"
+PIN_ENC_RA = "D0"  # right motor encoder
+PIN_ENC_LA = "D1"  # left motor encoder
 
-# TCA9548A channel assignments -- keep consistent with the cable harness.
-TCA_CHAN_FRONT = 0
-TCA_CHAN_LEFT = 1
-TCA_CHAN_RIGHT = 2
+# I2C addresses assigned to each VL53L0X during XSHUT init sequence.
+# All three start at the factory default (0x29); we wake them one at a
+# time and reprogram each to a unique address before enabling the next.
+TOF_ADDR_RIGHT  = 0x2A
+TOF_ADDR_MIDDLE = 0x2B
+TOF_ADDR_LEFT   = 0x2C
 
 # Encoder counts per output-shaft revolution.  1:50 N20 + 11 ppr hall
 # gives 550 edges/rev counted on a single channel; quadrature x4 = 2200.
@@ -77,7 +90,6 @@ def _import_circuitpython():
     import pwmio       # noqa: F401
     import countio     # noqa: F401
     import time as _time
-    import adafruit_tca9548a
     import adafruit_vl53l0x
     # On-board IMU on XIAO Sense.  LSM6DS3TR-C is a register-compatible
     # variant of LSM6DS3; adafruit_lsm6ds.lsm6ds3trc is the right driver.
@@ -85,51 +97,107 @@ def _import_circuitpython():
     return {
         "board": board, "busio": busio, "digitalio": digitalio,
         "pwmio": pwmio, "countio": countio, "time": _time,
-        "tca9548a": adafruit_tca9548a, "vl53l0x": adafruit_vl53l0x,
-        "lsm6": _lsm6,
+        "vl53l0x": adafruit_vl53l0x, "lsm6": _lsm6,
     }
 
 
 # -----------------------------------------------------------------------------
-# Sensors -- ToF triplet via TCA mux
+# Sensors -- ToF triplet via XSHUT address assignment
 # -----------------------------------------------------------------------------
 
 class TcaVL53L0X(object):
-    """3-channel VL53L0X reader behind a TCA9548A mux.
+    """3-channel VL53L0X on a shared I2C bus, addressed via XSHUT pins.
 
-    Identical conceptually to the RP2040 build.  Reuses the same library
-    chain; only the I2C bus pins differ.
+    All three sensors default to address 0x29.  Init sequence:
+      1. Pull all XSHUT pins low -- every sensor enters reset (bus clear).
+      2. Release one XSHUT, wait for the sensor to boot, reassign its
+         address, then move on to the next.
+    After init, all three sit permanently on the bus at distinct addresses
+    and are read directly with no mux chip required.
     """
 
     def __init__(self, mods=None):
         if mods is None:
             mods = _import_circuitpython()
         self._mods = mods
-        board = mods["board"]
-        busio = mods["busio"]
+        board    = mods["board"]
+        busio    = mods["busio"]
+        digitalio = mods["digitalio"]
+        vl53     = mods["vl53l0x"]
+        _time    = mods["time"]
+
+        def _xshut(pin_name):
+            io = digitalio.DigitalInOut(getattr(board, pin_name))
+            io.direction = digitalio.Direction.OUTPUT
+            io.value = False   # low = sensor held in reset
+            return io
+
+        # Init I2C first while sensors are still active (pull-ups live),
+        # then pull XSHUT lines low to begin the address-assignment sequence.
+        # Use bitbangio to bypass CircuitPython 10.x hardware pull-up check.
         sda = getattr(board, PIN_I2C_SDA)
         scl = getattr(board, PIN_I2C_SCL)
-        self._i2c = busio.I2C(scl, sda)
-        self.mux = mods["tca9548a"].TCA9548A(self._i2c)
-        self.front = mods["vl53l0x"].VL53L0X(self.mux[TCA_CHAN_FRONT])
-        self.left = mods["vl53l0x"].VL53L0X(self.mux[TCA_CHAN_LEFT])
-        self.right = mods["vl53l0x"].VL53L0X(self.mux[TCA_CHAN_RIGHT])
-        # ~33 ms timing budget = max 30 Hz, plenty for the 50-200 Hz
-        # control loop's needs.  Trade range vs. rate by adjusting.
-        for s in (self.front, self.left, self.right):
-            s.measurement_timing_budget = 33000
+        import bitbangio
+        self._i2c = bitbangio.I2C(scl, sda)
+
+        xshut_right  = _xshut(PIN_TOF_XSHUT_RIGHT)
+        xshut_middle = _xshut(PIN_TOF_XSHUT_MIDDLE)
+        xshut_left   = _xshut(PIN_TOF_XSHUT_LEFT)
+        _time.sleep(0.01)  # let all sensors enter reset before waking them one by one
+
+        # Wake right, reassign, then leave it running at TOF_ADDR_RIGHT.
+        xshut_right.value = True
+        _time.sleep(0.01)
+        self.right = vl53.VL53L0X(self._i2c)
+        self.right.set_address(TOF_ADDR_RIGHT)
+
+        # Wake middle (still at factory 0x29 -- no conflict now).
+        xshut_middle.value = True
+        _time.sleep(0.01)
+        self.middle = vl53.VL53L0X(self._i2c)
+        self.middle.set_address(TOF_ADDR_MIDDLE)
+
+        # Wake left.
+        xshut_left.value = True
+        _time.sleep(0.01)
+        self.left = vl53.VL53L0X(self._i2c)
+        self.left.set_address(TOF_ADDR_LEFT)
+
+        # ~33 ms timing budget = max 30 Hz, plenty for the control loop.
+        for sensor in (self.right, self.middle, self.left):
+            sensor.measurement_timing_budget = 33000
+
+        # Load calibration if available; fall back to identity per sensor.
+        self._cal = {"right":  (1.0, 0.0),
+                     "middle": (1.0, 0.0),
+                     "left":   (1.0, 0.0)}
+        try:
+            import json
+            with open("/tof_cal.json") as _f:
+                _d = json.load(_f)
+            for _k in ("right", "middle", "left"):
+                if _k in _d:
+                    self._cal[_k] = (_d[_k]["slope"], _d[_k]["offset"])
+        except (OSError, ValueError, KeyError):
+            pass   # no calibration file -- identity is fine
 
     def read(self):
         from interfaces import Reading
-        def _to_m(mm):
-            d = mm / 1000.0
+
+        def _to_m(raw_mm, slope, offset):
+            corrected = slope * raw_mm + offset
+            d = corrected / 1000.0
             if d <= 0.0 or d > 1.2:
                 return 1.2
             return d
+
+        rs, ro = self._cal["right"]
+        ms, mo = self._cal["middle"]
+        ls, lo = self._cal["left"]
         return Reading(
-            front=_to_m(self.front.range),
-            left=_to_m(self.left.range),
-            right=_to_m(self.right.range),
+            front=_to_m(self.middle.range, ms, mo),
+            left=_to_m(self.left.range,   ls, lo),
+            right=_to_m(self.right.range,  rs, ro),
             timestamp=self._mods["time"].monotonic(),
         )
 
@@ -171,16 +239,18 @@ class XiaoIMU(object):
         # Internal IMU I2C bus on XIAO Sense.  Some firmwares expose this
         # via board.IMU_I2C() helper; older ones need manual construction
         # from explicit pin names (P0_24/P0_25 on nRF52840).
-        board = mods["board"]
-        busio = mods["busio"]
-        try:
-            self._i2c = board.IMU_I2C()
-        except AttributeError:
-            # Manual pin names -- adjust for your board variant if these
-            # constants aren't present.
-            sda = getattr(board, "IMU_SDA", None) or getattr(board, "P0_25")
-            scl = getattr(board, "IMU_SCL", None) or getattr(board, "P0_24")
-            self._i2c = busio.I2C(scl, sda)
+        board    = mods["board"]
+        busio    = mods["busio"]
+        digitalio = mods["digitalio"]
+        _time    = mods["time"]
+
+        # IMU_PWR must be driven high before the internal I2C bus has pull-ups.
+        imu_pwr = digitalio.DigitalInOut(board.IMU_PWR)
+        imu_pwr.direction = digitalio.Direction.OUTPUT
+        imu_pwr.value = True
+        _time.sleep(0.05)  # allow rail to stabilise
+
+        self._i2c = busio.I2C(board.IMU_SCL, board.IMU_SDA)
         self._dev = mods["lsm6"].LSM6DS3TRC(self._i2c)
 
     def read(self):
@@ -238,15 +308,14 @@ class DriverN20(object):
         self._enc_r = countio.Counter(getattr(board, PIN_ENC_RA))
 
         from algorithm import WheelController
-        # Apply the software PWM cap from tunables -- protects DRV8833
-        # under sustained-stall conditions.
         cap = tunables.motor_duty_cap
+        dband = getattr(tunables, "motor_duty_min", 0.0)
         self._wc_l = WheelController(
             tunables.encoder_kp, tunables.encoder_ki,
-            duty_min=-cap, duty_max=cap)
+            duty_min=-cap, duty_max=cap, duty_deadband=dband)
         self._wc_r = WheelController(
             tunables.encoder_kp, tunables.encoder_ki,
-            duty_min=-cap, duty_max=cap)
+            duty_min=-cap, duty_max=cap, duty_deadband=dband)
 
         self._wheel_circ_m = tunables.wheel_diameter_m * 3.141592653589793
         self._loop_dt = 1.0 / tunables.loop_hz
@@ -292,12 +361,20 @@ class DriverN20(object):
         duty_r = self._wc_r.update(cmd.right, meas_r, dt)
         self._last_cmd_sign_l = 1 if cmd.left >= 0 else -1
         self._last_cmd_sign_r = 1 if cmd.right >= 0 else -1
-        self._set_pwm(self._m1a, self._m1b, duty_l)
-        self._set_pwm(self._m2a, self._m2b, duty_r)
+        self._set_pwm(self._m1a, self._m1b, -duty_l if MOTOR_LEFT_INVERT  else duty_l)
+        self._set_pwm(self._m2a, self._m2b, -duty_r if MOTOR_RIGHT_INVERT else duty_r)
         self._last_meas = (meas_l, meas_r)
 
     def read_encoders(self):
         return self._last_meas
+
+    def raw_drive(self, duty_l, duty_r):
+        """Drive both motors at a fixed duty (-1.0 to 1.0), bypassing PID.
+        Respects MOTOR_*_INVERT.  Use for bench testing only."""
+        self._set_pwm(self._m1a, self._m1b,
+                      -duty_l if MOTOR_LEFT_INVERT  else duty_l)
+        self._set_pwm(self._m2a, self._m2b,
+                      -duty_r if MOTOR_RIGHT_INVERT else duty_r)
 
     def stop(self):
         from interfaces import WheelSpeeds

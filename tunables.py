@@ -26,8 +26,8 @@ import json
 
 _DEFAULTS = {
     # --- Robot geometry --------------------------------------------------
-    "wheel_diameter_m":           0.032,
-    "wheel_base_m":               0.085,
+    "wheel_diameter_m":           0.049,
+    "wheel_base_m":               0.100,
     "chassis_radius_m":           0.035,
     "sensor_forward_offset_m":    0.03,
     "side_sensor_angle_rad":      0.7853981633974483,  # pi/4
@@ -43,15 +43,15 @@ _DEFAULTS = {
     "sensor_noise_sigma_m":       0.003,
 
     # --- Outer-loop control thresholds -----------------------------------
-    "front_stop_m":               0.12,
+    "front_stop_m":               0.15,
     "side_min_m":                 0.07,
     "side_target_m":              0.08,
 
     # --- Speeds & steering -----------------------------------------------
-    "cruise_speed_mps":           0.30,
+    "cruise_speed_mps":           0.20,
     "max_speed_mps":              0.50,
     "min_speed_mps":              0.05,
-    "turn_speed_mps":             0.15,
+    "turn_speed_mps":             0.08,
     "steer_gain":                 0.5,
     # Wall-centering bias: when both sides see finite walls, gently steer
     # toward balanced clearance.  0.0 disables.
@@ -94,7 +94,7 @@ _DEFAULTS = {
     # Wall observations only happen when |theta - cardinal| is within this
     # band -- mid-pivot the 45-degree side rays don't map cleanly onto
     # cell sides, so we skip the observation rather than poison the map.
-    "planner_observe_tol_rad":    0.15,
+    "planner_observe_tol_rad":    0.35,
 
     # --- Risk-weighted planner cost factors ------------------------------
     # Each cell-to-cell step has cost 1.0 + (these).  Tuning these is the
@@ -255,6 +255,7 @@ _DEFAULTS = {
     # request.  1.0 = no cap (default), 0.85 = 85% peak duty.  Useful as
     # a safety net for sustained-stall scenarios.
     "motor_duty_cap":             1.0,
+    "motor_duty_min":             0.90,
 
     # --- Sim-only (ignored on real hardware) -----------------------------
     "sim_wheel_tau_s":            0.04,    # 1st-order lag time constant

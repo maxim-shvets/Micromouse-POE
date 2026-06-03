@@ -55,6 +55,8 @@ CircuitPython-portable: no f-strings, plain classes.
 """
 
 import time
+import gc
+gc.collect()
 
 from hardware.xiao_nrf52840 import (
     TcaVL53L0X, XiaoIMU, DriverN20, MonotonicClock)
@@ -69,8 +71,8 @@ from tunables import Tunables
 # Run configuration -- edit to match your maze / preferences.
 # -----------------------------------------------------------------------------
 
-COLS = 16
-ROWS = 16
+COLS = 4
+ROWS = 4
 
 # Start cell + initial heading (1.5708 rad = facing North / +y).
 START_CELL = (0, 0)
@@ -95,8 +97,8 @@ REACH_DWELL_TICKS = 8
 
 # No-progress watchdog: if the robot moves less than this (m) over
 # WATCHDOG_WINDOW_S while commanding motion, abort the phase.
-WATCHDOG_MIN_MOVE_M = 0.03
-WATCHDOG_WINDOW_S = 6.0
+WATCHDOG_MIN_MOVE_M = 0.01
+WATCHDOG_WINDOW_S = 30.0
 
 # SPEED-phase tunable overrides layered on top of the base profile.
 # Conservative "race-lite" by default -- bump cruise/max toward the race
@@ -165,8 +167,9 @@ def _goal_cell():
 
 
 def make_planner(goal, shared_map, tun):
-    """Build a planner for `goal`.  If `shared_map` is given, adopt it so
-    the accumulated walls carry across phases."""
+    """Build a planner for `goal`.  Passes `shared_map` directly so no
+    throwaway KnownMap is ever allocated."""
+    gc.collect()
     p = FloodFillPlanner(
         cols=COLS, rows=ROWS, goal_cell=goal,
         cell_size_m=tun.planner_cell_size_m,
@@ -175,11 +178,12 @@ def make_planner(goal, shared_map, tun):
         unknown_cost=tun.planner_unknown_cost,
         use_diagonals=tun.planner_use_diagonals,
         diagonal_strict=tun.planner_diagonal_strict,
+        existing_map=shared_map,
     )
     if shared_map is not None:
-        p.map = shared_map
         p._dirty = True
         p.replan()
+    gc.collect()
     return p
 
 
@@ -208,6 +212,20 @@ def run_phase(name, target_cells, controller, planner, estimator,
     print("PHASE {}: target {} ...".format(name, sorted(target_cells)))
     ble.send(name + " ...")
     dt = 1.0 / tun.loop_hz
+
+    # Warmup: run sensor + estimator updates with motors stopped for 10 ticks
+    # so the controller's first live command is based on a settled pose and the
+    # wheel speed history starts at zero (prevents initial backward lurch).
+    for _ in range(10):
+        reading = sensors.read()
+        encoders = drive.read_encoders()
+        imu_r = imu.read()
+        estimator.update(encoders[0], encoders[1], dt,
+                         imu_reading=imu_r, reading=reading)
+        controller.step(reading, encoders, dt, imu_reading=imu_r)
+        clock.sleep(dt)
+    drive.stop()
+
     t0 = clock.now()
     dwell = 0
 
@@ -227,6 +245,20 @@ def run_phase(name, target_cells, controller, planner, estimator,
                          imu_reading=imu_r, reading=reading)
         cmd = controller.step(reading, encoders, dt, imu_reading=imu_r)
         cmd = controller._rate_limit(cmd, dt)
+        from interfaces import WheelSpeeds as _WS
+        # Prevent backward TRANSLATION (robot centre moving backward) while
+        # still allowing in-place pivoting (one wheel negative, one positive).
+        mean_v = (cmd.left + cmd.right) * 0.5
+        if mean_v < 0.0:
+            diff = (cmd.right - cmd.left) * 0.5
+            cmd = _WS(-diff, diff)   # pure pivot, zero net translation
+
+        # Front-wall brake: if a wall is very close ahead, zero the forward
+        # component and keep only the turning differential so the robot
+        # pivots away instead of driving into the wall.
+        if reading.front < 0.10:
+            diff = (cmd.right - cmd.left) * 0.5
+            cmd = _WS(-diff, diff)
         drive.set_wheel_speeds(cmd)
 
         x, y, _th = estimator.pose()
@@ -323,9 +355,14 @@ def main():
           "est": ScanMatchSlam(sx, sy, START_THETA, base_planner.map, base_tun)}
 
     def reset_pose():
+        st["est"] = None          # free old estimator before allocating new one
+        gc.collect()
         st["est"] = ScanMatchSlam(sx, sy, START_THETA, st["map"], base_tun)
 
     def reset_map():
+        st["est"] = None
+        st["map"] = None
+        gc.collect()
         np_ = make_planner(_goal_cell(), None, base_tun)
         st["map"] = np_.map
         reset_pose()
@@ -336,7 +373,9 @@ def main():
             base=base_tun)
 
     def run_one(name, goal, target, tun, max_t):
+        gc.collect()
         planner = make_planner(goal, st["map"], tun)
+        gc.collect()
         ctrl = make_controller(planner, st["est"], tun)
         rgb = _PHASE_RGB.get(name, (False, True, False))
         led.set(rgb[0], rgb[1], rgb[2])
@@ -394,7 +433,8 @@ def main():
 
     # --- BLE command loop ------------------------------------------------
     print("BLE ready. Advertising as 'Micromouse'. Send: "
-          "go explore return speed stop reset status")
+          "go explore return speed stop reset status "
+          "sensors enc motors mem")
     was_connected = False
     while True:
         ble.service()
@@ -439,6 +479,49 @@ def main():
                     cc = max(0, min(COLS - 1, int(x / s)))
                     rr = max(0, min(ROWS - 1, int(y / s)))
                     ble.send("READY cell ({}, {})".format(cc, rr))
+                elif c == "mem":
+                    ble.send("free: {} bytes".format(gc.mem_free()))
+                elif c in ("sensors", "tof"):
+                    ble.send("taking 10 readings...")
+                    readings = []
+                    for _ in range(10):
+                        r = sensors.read()
+                        readings.append(r)
+                        clock.sleep(0.05)
+                    def avg(vals):
+                        return sum(vals) / len(vals)
+                    fronts = [r.front for r in readings]
+                    lefts  = [r.left  for r in readings]
+                    rights = [r.right for r in readings]
+                    ble.send("front: {:.3f} m  (min {:.3f} max {:.3f})".format(
+                        avg(fronts), min(fronts), max(fronts)))
+                    ble.send("left : {:.3f} m  (min {:.3f} max {:.3f})".format(
+                        avg(lefts), min(lefts), max(lefts)))
+                    ble.send("right: {:.3f} m  (min {:.3f} max {:.3f})".format(
+                        avg(rights), min(rights), max(rights)))
+                    ble.send("1.2 m = no target in range")
+                elif c in ("enc", "encoders"):
+                    ble.send("spin wheels by hand for 3s...")
+                    l0 = drive._enc_l.count
+                    r0 = drive._enc_r.count
+                    clock.sleep(3.0)
+                    ble.send("L={} R={}".format(
+                        drive._enc_l.count - l0,
+                        drive._enc_r.count - r0))
+                elif c in ("motors", "motortest"):
+                    ble.send("motor test -- prop robot up!")
+                    clock.sleep(1.0)
+                    for pct in (30, 50, 75, 100):
+                        ble.send("fwd {}%".format(pct))
+                        drive.raw_drive(pct / 100.0, pct / 100.0)
+                        clock.sleep(1.5)
+                    drive.stop()
+                    clock.sleep(0.5)
+                    ble.send("reverse 50%")
+                    drive.raw_drive(-0.5, -0.5)
+                    clock.sleep(1.5)
+                    drive.stop()
+                    ble.send("motor test done")
                 elif c in ("stop", "x", "halt"):
                     drive.stop()
                     ble.send("idle")

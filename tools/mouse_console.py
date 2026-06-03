@@ -48,7 +48,7 @@ BANNER = """\
 ------------------------------------------------------------
   Micromouse BLE console
   robot : go  explore  return  speed  stop  reset  status
-  local : help  quit
+  local : help  quit  disconnect
   (Ctrl-C sends 'stop' then exits)
 ------------------------------------------------------------"""
 
@@ -155,6 +155,13 @@ async def run_console(device, log_path):
             low = cmd.lower()
             if low in ("quit", "q", "exit"):
                 break
+            if low in ("disconnect", "dc"):
+                # Exit without sending stop — robot keeps running.
+                try:
+                    await client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
             if low == "help":
                 print(BANNER)
             elif low == "scan":
@@ -166,7 +173,6 @@ async def run_console(device, log_path):
     except KeyboardInterrupt:
         print("\n^C")
     finally:
-        # Safety: always try to stop the motors before leaving.
         try:
             if client.is_connected:
                 await send("stop")

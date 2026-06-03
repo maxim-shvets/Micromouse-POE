@@ -189,19 +189,23 @@ class WheelController(object):
 
     __slots__ = ("kp", "ki", "_integral", "_last_cmd_sign", "duty_min", "duty_max")
 
-    def __init__(self, kp, ki, duty_min=-1.0, duty_max=1.0):
+    def __init__(self, kp, ki, duty_min=-1.0, duty_max=1.0, duty_deadband=0.0):
         self.kp = kp
         self.ki = ki
         self._integral = 0.0
         self._last_cmd_sign = 0
         self.duty_min = duty_min
         self.duty_max = duty_max
+        self.duty_deadband = duty_deadband  # minimum duty when motor is commanded
 
     def update(self, cmd_mps, measured_mps, dt):
         sign = 0 if cmd_mps == 0.0 else (1 if cmd_mps > 0.0 else -1)
         if sign != self._last_cmd_sign:
             self._integral = 0.0
             self._last_cmd_sign = sign
+
+        if sign == 0:
+            return 0.0
 
         err = cmd_mps - measured_mps
         unclamped = self.kp * err + self.ki * self._integral
@@ -212,6 +216,15 @@ class WheelController(object):
         else:
             duty = unclamped
             self._integral += err * dt
+
+        # Kickstart only: apply minimum duty when the wheel is near-stationary
+        # to overcome stiction.  Once moving, let the PID run freely so slow
+        # turn commands don't overshoot.
+        if abs(measured_mps) < 0.02:
+            if duty > 0.0 and duty < self.duty_deadband:
+                duty = self.duty_deadband
+            elif duty < 0.0 and duty > -self.duty_deadband:
+                duty = -self.duty_deadband
         return duty
 
 
